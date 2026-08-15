@@ -1,0 +1,151 @@
+# =========================================================
+# FASTAPI / PYTHON BACKEND
+# =========================================================
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Type checking
+.mypy_cache/
+.pyre/
+.pytype/
+
+# Ruff
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+logs/
+
+# FastAPI / Uvicorn temporary files
+*.pid
+
+# =========================================================
+# FLUTTER / DART
+# =========================================================
+
+# Flutter/Dart generated files
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+
+# Flutter build output
+build/
+
+# Pub cache
+.pub-cache/
+
+# Generated files
+*.g.dart
+*.freezed.dart
+
+# Android generated files
+android/.gradle/
+android/.idea/
+android/app/build/
+android/build/
+android/local.properties
+android/.cxx/
+
+# Android signing files
+android/key.properties
+android/app/*.jks
+android/app/*.keystore
+
+# iOS generated files
+ios/Pods/
+ios/.symlinks/
+ios/Flutter/ephemeral/
+ios/Flutter/.last_build_id
+
+# Xcode
+**/xcuserdata/
+**/DerivedData/
+*.xcuserstate
+
+# macOS
+.DS_Store
+
+# =========================================================
+# IDE / EDITORS
+# =========================================================
+
+.vscode/
+.idea/
+
+# VS Code workspace files
+*.code-workspace
+
+# =========================================================
+# OPERATING SYSTEM
+# =========================================================
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
+
+# Linux
+*~
+
+# =========================================================
+# TEMPORARY FILES
+# =========================================================
+
+*.tmp
+*.temp
+*.swp
+*.swo
+
+# =========================================================
+# DATABASE / LOCAL FILES
+# =========================================================
+
+*.sqlite
+*.sqlite3
+*.db
+
+# =========================================================
+# SECRETS / CERTIFICATES
+# =========================================================
+
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx

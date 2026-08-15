@@ -1,0 +1,18 @@
+[Unit]
+Description=Robot Control Pi discovery beacon (mDNS + UDP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@HOME@/raspberry_pi
+# Wait for default route (Wi‑Fi often lags network-online on Pi boot).
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do ip route show default 2>/dev/null | grep -q . && exit 0; sleep 2; done; exit 1'
+ExecStart=/usr/bin/python3 @HOME@/raspberry_pi/pi_beacon.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

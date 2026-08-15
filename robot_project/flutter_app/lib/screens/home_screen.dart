@@ -1,0 +1,895 @@
+import 'dart:async';
+import 'package:flutter/material.dart';
+import '../models/robot_state.dart';
+import '../services/notification_service.dart';
+import '../services/prefs_service.dart';
+import '../services/robot_service.dart';
+import '../theme/app_theme.dart';
+import '../widgets/notification_panel.dart';
+import '../widgets/status_card.dart';
+import '../widgets/action_button.dart';
+import '../widgets/app_logo.dart';
+import '../widgets/joystick_widget.dart';
+import 'login_screen.dart';
+import 'missions_screen.dart';
+import 'logs_screen.dart';
+import 'settings_screen.dart';
+
+class HomeScreen extends StatefulWidget {
+  final RobotService service;
+  const HomeScreen({super.key, required this.service});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+enum _ControlMode { navigation, joystick }
+
+class _HomeScreenState extends State<HomeScreen> {
+  RobotState _state = RobotState.initial();
+  List<String> _destinations = [];
+  String? _selectedDest;
+  bool _loadingStart = false;
+  bool _loadingNav = false;
+  bool _loadingMotors = false;
+  bool _loadingTestDrive = false;
+  bool _loadingReady = false;
+  String? _actionError;
+  _ControlMode _controlMode = _ControlMode.navigation;
+  bool _joystickActive = false;
+  bool _joystickDebugShown = false;
+  Timer? _cmdVelTimer;
+  Timer? _uiThrottleTimer;
+  double _lastLinear = 0;
+  double _lastAngular = 0;
+
+  final _notifications = NotificationService();
+  List<AppNotification> _notificationItems = [];
+  Timer? _idleTimer;
+  StreamSubscription<RobotState>? _stateSub;
+  StreamSubscription<List<AppNotification>>? _notifSub;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.service.connect();
+    _stateSub = widget.service.stateStream.listen((s) {
+      final prev = _state;
+      _state = s;
+      _notifications.onStateUpdate(s);
+      if (_joystickActive) {
+        final critical = prev.status != s.status ||
+            prev.rosRunning != s.rosRunning ||
+            prev.connection != s.connection ||
+            prev.bridgeVerified != s.bridgeVerified;
+        if (critical) {
+          setState(() {});
+        } else {
+          _scheduleUiRefresh();
+        }
+      } else {
+        setState(() {});
+      }
+    });
+    _notifSub = _notifications.stream.listen((items) {
+      setState(() => _notificationItems = items);
+    });
+    _loadDestinations();
+    _resetIdleTimer();
+  }
+
+  Future<void> _loadDestinations() async {
+    try {
+      final dests = await widget.service.getDestinations();
+      if (mounted) setState(() => _destinations = dests);
+    } catch (_) {}
+  }
+
+  void _resetIdleTimer() {
+    _idleTimer?.cancel();
+    PrefsService.getIdleTimeoutMinutes().then((minutes) {
+      if (minutes <= 0 || !mounted) return;
+      _idleTimer = Timer(Duration(minutes: minutes), _onIdleTimeout);
+    });
+  }
+
+  void _onIdleTimeout() {
+    if (!mounted) return;
+    widget.service.logout();
+    Navigator.pushAndRemoveUntil(
+      context,
+      MaterialPageRoute(builder: (_) => const LoginScreen()),
+      (_) => false,
+    );
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Signed out due to inactivity.')),
+    );
+  }
+
+  Future<void> _start() async {
+    setState(() { _loadingStart = true; _actionError = null; });
+    try {
+      await widget.service.startRobot();
+      await _waitForBridgePopup();
+    } catch (e) {
+      var msg = e.toString().replaceFirst('Exception: ', '');
+      try {
+        final link = await widget.service.checkReal1Link();
+        if (link['ok'] != true && link['hint'] != null) {
+          msg = '${link['hint']}\n$msg';
+        }
+      } catch (_) {}
+      setState(() => _actionError = msg);
+      final bridge = await widget.service.getBridgeStatus();
+      await _showBridgePopup(bridge, failed: !_bridgeLooksOk(bridge));
+    } finally {
+      setState(() => _loadingStart = false);
+    }
+  }
+
+  bool _bridgeLooksOk(Map<String, dynamic> bridge) {
+    if (bridge['ok'] == true) return true;
+    if (bridge['ros_node_visible'] == true) return true;
+    if (bridge['warming_up'] == true && bridge['process_alive'] == true) return true;
+    return bridge['process_alive'] == true &&
+        bridge['cmd_vel_subscriber'] == true;
+  }
+
+  String _formatBridgeDetails(Map<String, dynamic> b) {
+    final subs = b['bridge_subscriptions'];
+    final lines = <String>[
+      b['hint']?.toString() ?? '',
+      if (b['launch_command'] != null) 'Command: ${b['launch_command']}',
+      if (b['pid'] != null) 'PID: ${b['pid']}',
+      'Process alive: ${b['process_alive'] == true}',
+      'ROS node robot_bridge: ${b['ros_node_visible'] == true}',
+      'cmd_vel subscriber on ${b['cmd_vel_topic'] ?? '/cmd_vel'}: ${b['cmd_vel_subscriber'] == true}',
+      if (subs is List && subs.isNotEmpty) 'Bridge subscribes to: ${subs.join(', ')}',
+    ];
+    return lines.where((l) => l.isNotEmpty).join('\n');
+  }
+
+  Future<void> _showBridgePopup(Map<String, dynamic> bridge,
+      {bool failed = false}) async {
+    if (!mounted) return;
+    final ok = _bridgeLooksOk(bridge) && !failed;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: Icon(
+          ok ? Icons.check_circle : Icons.warning_amber_rounded,
+          color: ok ? AppColors.green : AppColors.red,
+          size: 36,
+        ),
+        title: Text(ok ? 'robotBridge is running' : 'robotBridge NOT verified'),
+        content: SingleChildScrollView(
+          child: Text(
+            _formatBridgeDetails(bridge),
+            style: const TextStyle(fontSize: 13),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _waitForBridgePopup() async {
+    for (var i = 0; i < 65; i++) {
+      await Future.delayed(const Duration(seconds: 1));
+      if (!mounted) return;
+      final bridge = await widget.service.getBridgeStatus();
+      if (bridge['ros_node_visible'] == true || bridge['ok'] == true) {
+        await _showBridgePopup(bridge);
+        return;
+      }
+      if (bridge['warming_up'] == true && i < 64) {
+        continue;
+      }
+      if (_bridgeLooksOk(bridge) && bridge['warming_up'] != true) {
+        await _showBridgePopup(bridge);
+        return;
+      }
+    }
+    if (mounted) {
+      final bridge = await widget.service.getBridgeStatus();
+      await _showBridgePopup(bridge, failed: !_bridgeLooksOk(bridge));
+    }
+  }
+
+  Future<void> _showTeleopPopup(Map<String, dynamic> data,
+      {required String title}) async {
+    if (!mounted) return;
+    // Flatten nested debug payloads for display.
+    final flat = Map<String, dynamic>.from(data);
+    if (data['teleop'] is Map) {
+      flat.addAll(Map<String, dynamic>.from(data['teleop'] as Map));
+    }
+    if (data['relay'] is Map) {
+      final relay = data['relay'] as Map;
+      flat['relay_alive'] ??= relay['alive'];
+      flat['relay_pid'] ??= relay['pid'];
+      flat['relay_stats'] ??= relay['stats'];
+      flat['stats_linear'] ??= relay['stats_linear'];
+      flat['stats_angular'] ??= relay['stats_angular'];
+      flat['state_linear'] ??= relay['state_linear'];
+      flat['state_angular'] ??= relay['state_angular'];
+    }
+    if (data['connection'] is Map) {
+      final conn = data['connection'] as Map;
+      if (conn['bridge'] is Map) {
+        flat.addAll(Map<String, dynamic>.from(conn['bridge'] as Map));
+      }
+      if (conn['warnings'] is List && (conn['warnings'] as List).isNotEmpty) {
+        flat['hint'] = (conn['warnings'] as List).join('\n');
+      }
+    }
+    if (data['bridge'] is Map) {
+      flat.addAll(Map<String, dynamic>.from(data['bridge'] as Map));
+    }
+    if (data['cmd_vel_traffic'] is Map) {
+      final t = data['cmd_vel_traffic'] as Map;
+      if (t['echo_output'] != null) flat['cmd_vel_echo'] = t['echo_output'];
+      if (t['hz_output'] != null) flat['cmd_vel_hz'] = t['hz_output'];
+    }
+    data = flat;
+    final bridgeOk = data['bridge_ok'] == true;
+    final hasSub = data['cmd_vel_subscriber'] == true || data['bridge_listening'] == true;
+    final relayOk = data['relay_alive'] == true;
+    final hubReady = data['hub_ready'] == true;
+    final armed = data['teleop_armed'] == true || _joystickActive;
+    final publishing = armed && relayOk;
+    final ok = bridgeOk && hasSub && publishing;
+    final hint = data['hint']?.toString() ?? '';
+    final lines = <String>[
+      hint,
+      if (data['cmd_vel_topic'] != null) 'Topic: ${data['cmd_vel_topic']}',
+      if (data['cmd_vel_units'] != null) 'Units: ${data['cmd_vel_units']}',
+      if (data['linear_tablet'] != null)
+        'Tablet: linear=${data['linear_tablet']}, angular=${data['angular_tablet']}',
+      if (data['linear'] != null)
+        'ROS /cmd_vel: linear=${data['linear']}, angular=${data['angular']}',
+      if (data['publish_via'] != null) 'Publish via: ${data['publish_via']}',
+      'ROS hub (rclpy): ${hubReady ? 'YES' : 'NO'}',
+      'joystick armed: ${data['teleop_armed'] == true ? 'YES' : 'NO — tap JOYSTICK after READY'}',
+      'cmd_vel relay: ${relayOk ? 'YES pid=${data['relay_pid'] ?? '?'}' : 'NO (starts when JOYSTICK enabled)'}',
+      'bridge_ok: $bridgeOk',
+      'bridge listening: ${data['bridge_listening'] == true}',
+      if (data['relay_stats'] != null && '${data['relay_stats']}'.isNotEmpty)
+        'Relay stats: ${data['relay_stats']}',
+      if (data['stats_linear'] != null)
+        'Relay publishing: linear=${data['stats_linear']}, angular=${data['stats_angular'] ?? 0}',
+      if (data['state_linear'] != null)
+        'State file: linear=${data['state_linear']}, angular=${data['state_angular'] ?? 0}',
+      if (data['enable_motors'] != null && '${data['enable_motors']}'.isNotEmpty)
+        'Enable motors: ${data['enable_motors']}',
+      'cmd_vel subscriber: ${data['cmd_vel_subscriber'] == true}',
+      if (data['qos_compatible'] == false)
+        'QoS: INCOMPATIBLE — update relay on Pi (RELIABLE required)',
+      if (data['publish_count'] != null) 'publish_count: ${data['publish_count']}',
+      if (data['linear'] != null)
+        'speed: ${data['linear']}, turn: ${data['angular']}',
+    ].where((l) => l.isNotEmpty).join('\n');
+
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: Icon(
+          ok ? Icons.gamepad : Icons.warning_amber_rounded,
+          color: ok ? AppColors.green : AppColors.orange,
+          size: 36,
+        ),
+        title: Text(title),
+        content: SingleChildScrollView(
+          child: Text(lines, style: const TextStyle(fontSize: 13)),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _selectNavigationMode() async {
+    if (_controlMode == _ControlMode.navigation) return;
+    setState(() {
+      _controlMode = _ControlMode.navigation;
+      _joystickActive = false;
+    });
+    _cmdVelTimer?.cancel();
+    _uiThrottleTimer?.cancel();
+    try {
+      await widget.service.enableTeleop(false);
+    } catch (_) {}
+  }
+
+  Future<void> _selectJoystickMode() async {
+    if (!_state.canOperate) {
+      await _showBridgePopup(
+        _state.bridgeStatus.isNotEmpty
+            ? _state.bridgeStatus
+            : await widget.service.getBridgeStatus(),
+        failed: true,
+      );
+      return;
+    }
+    setState(() {
+      _controlMode = _ControlMode.joystick;
+      _actionError = null;
+      _joystickDebugShown = false;
+    });
+    try {
+      await widget.service.cancelNavigation();
+      final res = await widget.service.enableTeleop(true);
+      setState(() => _joystickActive = true);
+      final qosBad = res['qos_compatible'] == false || res['relay_best_effort'] == true;
+      final title = qosBad
+          ? 'QoS BLOCKED — robot will not move'
+          : 'Joystick armed — now DRAG the pad';
+      await _showTeleopPopup(res, title: title);
+    } catch (e) {
+      setState(() => _actionError = e.toString().replaceFirst('Exception: ', ''));
+    }
+  }
+
+  void _scheduleUiRefresh() {
+    _uiThrottleTimer ??= Timer(const Duration(milliseconds: 500), () {
+      _uiThrottleTimer = null;
+      if (mounted) setState(() {});
+    });
+  }
+
+  void _onJoystickMove(double linear, double angular) {
+    _lastLinear = linear;
+    _lastAngular = angular;
+    _cmdVelTimer ??= Timer.periodic(const Duration(milliseconds: 100), (_) {
+      _sendCmdVelTick();
+    });
+    _sendCmdVelTick();
+  }
+
+  void _sendCmdVelTick() {
+    widget.service.sendCmdVel(_lastLinear, _lastAngular).then((res) {
+      if (!mounted || _joystickDebugShown) return;
+      if (_lastLinear.abs() < 0.05 && _lastAngular.abs() < 0.05) return;
+      _joystickDebugShown = true;
+      final bridgeOk = res['bridge_ok'] == true;
+      final hasSub = res['cmd_vel_subscriber'] == true || res['bridge_listening'] == true;
+      final hubReady = res['hub_ready'] == true;
+      final relayOk = res['relay_alive'] == true;
+      final armed = res['teleop_armed'] == true || _joystickActive;
+      final units = res['cmd_vel_units']?.toString() ?? '';
+      final rosLinear = (res['linear'] as num?)?.toDouble() ?? 0.0;
+      var title = bridgeOk && hasSub && armed && relayOk
+          ? 'Joystick sending cmd_vel'
+          : 'Joystick active — robot may NOT move';
+      if (units == 'rpm' && _lastLinear.abs() > 0.05 && rosLinear.abs() < 1.0) {
+        title = 'Wrong speed scale — ROS linear=$rosLinear (need ~10 RPM)';
+      } else if (res['stats_linear'] != null &&
+          _lastLinear.abs() > 0.05 &&
+          (res['stats_linear'] as num).abs() < 0.01) {
+        title = 'Relay stuck at 0 — redeploy Pi backend (state file fix)';
+      }
+      _showTeleopPopup(res, title: title);
+    }).ignore();
+  }
+
+  Future<void> _onJoystickRelease() async {
+    _cmdVelTimer?.cancel();
+    _cmdVelTimer = null;
+    _lastLinear = 0;
+    _lastAngular = 0;
+    try {
+      await widget.service.sendCmdVel(0, 0);
+    } catch (_) {}
+  }
+
+  Future<void> _navigate(String dest) async {
+    if (_controlMode != _ControlMode.navigation) await _selectNavigationMode();
+    setState(() { _loadingNav = true; _actionError = null; });
+    try {
+      await widget.service.sendGoal(dest);
+    } catch (e) {
+      setState(() => _actionError = e.toString().replaceFirst('Exception: ', ''));
+    } finally {
+      setState(() => _loadingNav = false);
+    }
+  }
+
+  Future<void> _enableMotors() async {
+    setState(() => _loadingMotors = true);
+    try {
+      final res = await widget.service.enableMotors();
+      if (!mounted) return;
+      await _showTeleopPopup(res, title: res['ok'] == true ? 'Motors enabled' : 'Enable motors failed');
+    } catch (e) {
+      setState(() => _actionError = e.toString().replaceFirst('Exception: ', ''));
+    } finally {
+      if (mounted) setState(() => _loadingMotors = false);
+    }
+  }
+
+  Future<void> _testDrive() async {
+    setState(() => _loadingTestDrive = true);
+    try {
+      final res = await widget.service.testDrive();
+      if (!mounted) return;
+      await _showTeleopPopup(res, title: 'Test drive sent');
+    } catch (e) {
+      setState(() => _actionError = e.toString().replaceFirst('Exception: ', ''));
+    } finally {
+      if (mounted) setState(() => _loadingTestDrive = false);
+    }
+  }
+
+  Future<void> _debugJoystick() async {
+    try {
+      final conn = await widget.service.getTeleopConnection();
+      final res = await widget.service.getTeleopDebug();
+      if (!mounted) return;
+      final merged = Map<String, dynamic>.from(res);
+      merged['connection'] = conn;
+      if (conn['warnings'] is List && (conn['warnings'] as List).isNotEmpty) {
+        merged['hint'] = (conn['warnings'] as List).join('\n');
+      }
+      await _showTeleopPopup(merged, title: conn['chain_ok'] == true ? 'Connection OK' : 'Connection issue');
+    } catch (e) {
+      setState(() => _actionError = e.toString().replaceFirst('Exception: ', ''));
+    }
+  }
+
+  Future<void> _ready() async {
+    setState(() { _loadingReady = true; _actionError = null; });
+    try {
+      _cmdVelTimer?.cancel();
+      _cmdVelTimer = null;
+      if (_joystickActive) {
+        await widget.service.enableTeleop(false);
+        setState(() => _joystickActive = false);
+      }
+      await widget.service.setReady();
+    } catch (e) {
+      setState(() => _actionError = e.toString().replaceFirst('Exception: ', ''));
+    } finally {
+      setState(() => _loadingReady = false);
+    }
+  }
+
+  void _logout() {
+    widget.service.logout();
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(builder: (_) => const LoginScreen()),
+    );
+  }
+
+  @override
+  void dispose() {
+    _cmdVelTimer?.cancel();
+    _uiThrottleTimer?.cancel();
+    if (_joystickActive) widget.service.stopTeleop();
+    _idleTimer?.cancel();
+    _stateSub?.cancel();
+    _notifSub?.cancel();
+    _notifications.dispose();
+    widget.service.disconnect();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Listener(
+      onPointerDown: (_) => _resetIdleTimer(),
+      child: Scaffold(
+        appBar: AppBar(
+          title: FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: const [
+                AppLogo(size: 32, circular: true),
+                SizedBox(width: 8),
+                Text('Robot Controller'),
+              ],
+            ),
+          ),
+          actions: [
+            if (_notificationItems.any((n) => n.requiresAck))
+              IconButton(
+                icon: const Badge(
+                  label: Text('!'),
+                  child: Icon(Icons.notifications_active),
+                ),
+                tooltip: 'Notifications',
+                onPressed: () {},
+              ),
+            IconButton(
+              icon: const Icon(Icons.settings_outlined),
+              tooltip: 'Settings',
+              onPressed: () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => SettingsScreen(service: widget.service),
+                ),
+              ).then((_) => _loadDestinations()),
+            ),
+            IconButton(
+              icon: const Icon(Icons.article_outlined),
+              tooltip: 'Logs',
+              onPressed: () => Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => LogsScreen(service: widget.service)),
+              ),
+            ),
+            IconButton(
+              icon: const Icon(Icons.logout),
+              tooltip: 'Sign out',
+              onPressed: _logout,
+            ),
+          ],
+        ),
+        body: SingleChildScrollView(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            children: [
+              NotificationPanel(
+                notifications: _notificationItems,
+                onAck: _notifications.ack,
+              ),
+              StatusCard(state: _state),
+              if (_actionError != null) ...[
+                const SizedBox(height: 10),
+                _ErrorBanner(
+                  message: _actionError!,
+                  onDismiss: () => setState(() => _actionError = null),
+                ),
+              ],
+              const SizedBox(height: 20),
+              _buildNodeHealth(),
+              const SizedBox(height: 20),
+              _buildControls(),
+              const SizedBox(height: 20),
+              _buildModeSelector(),
+              const SizedBox(height: 16),
+              if (_controlMode == _ControlMode.navigation)
+                _buildNavigation()
+              else
+                _buildJoystick(),
+            ],
+          ),
+        ),
+        floatingActionButton: FloatingActionButton.extended(
+          backgroundColor: AppColors.navy,
+          foregroundColor: Colors.white,
+          icon: const Icon(Icons.route),
+          label: const Text('Mission'),
+          onPressed: () => Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => MissionsScreen(
+                service: widget.service,
+                destinations: _destinations,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildNodeHealth() {
+    if (_state.nodeHealth.isEmpty) return const SizedBox.shrink();
+    final allDead = _state.nodeHealth.values.every(
+      (v) => v == 'dead' || v == 'stopped' || v == 'unknown',
+    );
+    if (!_state.rosRunning && allDead && !_state.isError) {
+      return const SizedBox.shrink();
+    }
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Node Health',
+                style: TextStyle(fontWeight: FontWeight.w700, fontSize: 14)),
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: _state.nodeHealth.entries.map((e) {
+                final ok = e.value == 'running';
+                final color = ok
+                    ? AppColors.green
+                    : e.value == 'stopped'
+                        ? AppColors.textSecondary
+                        : AppColors.red;
+                return Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(ok ? Icons.check_circle : Icons.cancel, color: color, size: 14),
+                    const SizedBox(width: 4),
+                    Text(
+                      e.key.replaceAll('_', ' '),
+                      style: TextStyle(fontSize: 12, color: color),
+                    ),
+                  ],
+                );
+              }).toList(),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _startButtonLabel() {
+    if (_state.bridgeVerified) return 'robotBridge OK';
+    if (_state.isLaunching || _loadingStart) return 'Starting robotBridge...';
+    if (_state.rosRunning) return 'robotBridge NOT ready — tap START';
+    return 'START';
+  }
+
+  Widget _buildControls() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Robot Controls',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 16),
+            ActionButton(
+              label: _startButtonLabel(),
+              icon: Icons.play_circle_fill,
+              color: AppColors.navy,
+              loading: _loadingStart,
+              onPressed: _state.bridgeVerified ? null : _start,
+            ),
+            const SizedBox(height: 12),
+            ActionButton(
+              label: 'READY FOR WORK',
+              icon: Icons.task_alt,
+              color: AppColors.green,
+              loading: _loadingReady,
+              onPressed: _state.canOperate ? _ready : null,
+            ),
+            if (_state.rosRunning) ...[
+              const SizedBox(height: 12),
+              ActionButton(
+                label: 'STOP ROBOT',
+                icon: Icons.stop_circle,
+                color: AppColors.red,
+                onPressed: () => widget.service.stopRobot(),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildModeSelector() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Control Mode',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: ActionButton(
+                    label: 'NAVIGATION',
+                    icon: Icons.navigation,
+                    color: _controlMode == _ControlMode.navigation
+                        ? AppColors.navy
+                        : AppColors.textSecondary,
+                    onPressed: _state.canOperate ? _selectNavigationMode : null,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: ActionButton(
+                    label: 'JOYSTICK',
+                    icon: Icons.gamepad,
+                    color: _controlMode == _ControlMode.joystick
+                        ? AppColors.orange
+                        : AppColors.textSecondary,
+                    onPressed: _state.canOperate ? _selectJoystickMode : null,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              _controlMode == _ControlMode.navigation
+                  ? 'Nav2 autonomous navigation to named destinations'
+                  : 'Runs gamepad.py on the Pi for manual drive',
+              style: const TextStyle(fontSize: 12, color: AppColors.textSecondary),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildJoystick() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.gamepad, color: AppColors.orange),
+                const SizedBox(width: 8),
+                const Text('Joystick Control',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+                const Spacer(),
+                if (_joystickActive)
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: AppColors.orange.withValues(alpha: 0.15),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: const Text('ACTIVE',
+                        style: TextStyle(
+                            color: AppColors.orange,
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700)),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            JoystickWidget(
+              enabled: _joystickActive && _state.canOperate,
+              onMove: _onJoystickMove,
+              onRelease: _onJoystickRelease,
+            ),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                OutlinedButton.icon(
+                  onPressed: _state.canOperate && !_loadingMotors ? _enableMotors : null,
+                  icon: _loadingMotors
+                      ? const SizedBox(
+                          width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.power, size: 18),
+                  label: const Text('Enable motors'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: _joystickActive && !_loadingTestDrive ? _testDrive : null,
+                  icon: _loadingTestDrive
+                      ? const SizedBox(
+                          width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.speed, size: 18),
+                  label: const Text('Test drive'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: _joystickActive ? _debugJoystick : null,
+                  icon: const Icon(Icons.bug_report, size: 18),
+                  label: const Text('Debug'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'Pi runs gamepad.py + tablet /cmd_vel. After READY: Enable motors → JOYSTICK.',
+              style: TextStyle(fontSize: 11, color: AppColors.textSecondary),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildNavigation() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Text('Navigate To',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+                const Spacer(),
+                if (_state.isNavigating)
+                  TextButton.icon(
+                    onPressed: () => widget.service.cancelNavigation(),
+                    icon: const Icon(Icons.cancel, size: 16, color: AppColors.orange),
+                    label: const Text('Cancel', style: TextStyle(color: AppColors.orange)),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            if (_destinations.isEmpty)
+              const Text('No destinations loaded.',
+                  style: TextStyle(color: AppColors.textSecondary))
+            else
+              Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: _destinations.map((dest) {
+                  final selected = _selectedDest == dest;
+                  return ChoiceChip(
+                    label: Text(dest),
+                    selected: selected,
+                    selectedColor: AppColors.navy,
+                    labelStyle: TextStyle(
+                      color: selected ? Colors.white : AppColors.textPrimary,
+                      fontWeight: FontWeight.w500,
+                    ),
+                    onSelected: _state.canOperate
+                        ? (_) => setState(() => _selectedDest = dest)
+                        : null,
+                  );
+                }).toList(),
+              ),
+            const SizedBox(height: 16),
+            ActionButton(
+              label: 'NAVIGATE',
+              icon: Icons.navigation,
+              color: AppColors.navy,
+              loading: _loadingNav,
+              onPressed: (_state.canOperate && _selectedDest != null && !_state.isNavigating)
+                  ? () => _navigate(_selectedDest!)
+                  : null,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ErrorBanner extends StatelessWidget {
+  final String message;
+  final VoidCallback onDismiss;
+  const _ErrorBanner({required this.message, required this.onDismiss});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: AppColors.red.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: AppColors.red.withValues(alpha: 0.3)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.error_outline, color: AppColors.red, size: 18),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(message, style: const TextStyle(color: AppColors.red, fontSize: 13)),
+          ),
+          IconButton(
+            icon: const Icon(Icons.close, size: 16, color: AppColors.red),
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(),
+            onPressed: onDismiss,
+          ),
+        ],
+      ),
+    );
+  }
+}

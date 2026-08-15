@@ -1,0 +1,6 @@
+{
+  "Kitchen": { "x": 2.1, "y": 0.5, "theta": 0 },
+  "Table 1": { "x": 4.2, "y": 1.8, "theta": 90 },
+  "Table 2": { "x": 5.0, "y": 3.2, "theta": 180 },
+  "Charging Dock": { "x": 0.0, "y": 0.0, "theta": 0 }
+}
