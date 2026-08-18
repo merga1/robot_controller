@@ -48,11 +48,24 @@ class _HomeScreenState extends State<HomeScreen> {
   Timer? _idleTimer;
   StreamSubscription<RobotState>? _stateSub;
   StreamSubscription<List<AppNotification>>? _notifSub;
+  StreamSubscription<void>? _authExpiredSub;
 
   @override
   void initState() {
     super.initState();
     widget.service.connect();
+    _authExpiredSub = widget.service.authExpiredStream.listen((_) {
+      if (!mounted) return;
+      widget.service.logout();
+      Navigator.pushAndRemoveUntil(
+        context,
+        MaterialPageRoute(builder: (_) => const LoginScreen()),
+        (_) => false,
+      );
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Session expired — please sign in again.')),
+      );
+    });
     _stateSub = widget.service.stateStream.listen((s) {
       final prev = _state;
       _state = s;
@@ -478,6 +491,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _idleTimer?.cancel();
     _stateSub?.cancel();
     _notifSub?.cancel();
+    _authExpiredSub?.cancel();
     _notifications.dispose();
     widget.service.disconnect();
     super.dispose();

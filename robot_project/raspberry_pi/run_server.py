@@ -4,11 +4,32 @@ import sys
 
 
 def _preflight() -> None:
-    """Fail fast if the Pi deployment is missing updated app modules."""
+    """Fail fast if the Pi deployment is missing updated app modules.
+
+    Checks specifically target functions that were absent from an older,
+    stale snapshot of app/ (pre RPM-unit-conversion, pre cmd_vel-relay,
+    pre motor-keepalive) that once caused the robot to report "connected"
+    while never actually sending a nonzero cmd_vel to robotBridge. A weaker
+    version of this check (testing only attribute names common to both old
+    and new code) could not catch that regression — these names can't.
+    """
     required = {
-        "app.robot_link": ("validate_link", "try_start_robot_bridge", "check_cmd_vel", "publish_cmd_vel"),
-        "app.ros_hub": ("start", "resync_cmd_vel_topic"),
-        "app.teleop": ("set_velocity", "stop"),
+        "app.robot_link": (
+            "validate_link",
+            "try_start_robot_bridge",
+            "check_cmd_vel",
+            "convert_cmd_vel",          # RPM unit scaling
+            "publish_cmd_vel",          # cmd_vel relay writer
+            "start_cmd_vel_relay",      # persistent RELIABLE-QoS publisher
+            "run_enable_motors",        # motor enable workflow
+        ),
+        "app.ros_hub": ("start", "resync_cmd_vel_topic", "set_cmd_vel", "teleop_armed"),
+        "app.teleop": (
+            "set_velocity",
+            "stop",
+            "start_motor_keepalive",
+            "ensure_armed",
+        ),
     }
     errors = []
     for module_name, attrs in required.items():

@@ -61,23 +61,25 @@ class PrefsService {
 
   static Future<void> savePiUsername(String user) async {
     final p = await SharedPreferences.getInstance();
-    await p.setString(_keyPiUser, piUsername);
+    await p.setString(_keyPiUser, user.trim().toLowerCase());
   }
 
   static Future<String> getPiUsername() async {
     final p = await SharedPreferences.getInstance();
     final saved = p.getString(_keyPiUser);
-    if (saved != null && saved.toLowerCase() == piUsername) {
-      return piUsername;
+    if (saved != null && saved.isNotEmpty) {
+      return saved;
     }
     return piUsername;
   }
 
-  static Future<void> saveConnection(String ip, String port) async {
+  static Future<void> saveConnection(String ip, String port, {String? username}) async {
     final p = await SharedPreferences.getInstance();
     await p.setString(_keyPiIp, ip);
     await p.setString(_keyPiPort, port);
-    await p.setString(_keyPiUser, piUsername);
+    if (username != null && username.isNotEmpty) {
+      await p.setString(_keyPiUser, username.trim().toLowerCase());
+    }
   }
 
   static Future<void> saveLastUser(String user) async {

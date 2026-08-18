@@ -13,6 +13,14 @@ class RobotService {
   final _states = StreamController<RobotState>.broadcast();
   Stream<RobotState> get stateStream => _states.stream;
 
+  // Fires once when the API rejects the current token (expired/invalid, HTTP
+  // 401) so the UI can prompt for re-login instead of the state stream just
+  // silently going quiet. JWTs expire after 1 hour server-side (auth.py
+  // TOKEN_TTL) regardless of the client's idle-timeout setting.
+  final _authExpired = StreamController<void>.broadcast();
+  Stream<void> get authExpiredStream => _authExpired.stream;
+  bool _authExpiredFired = false;
+
   RobotService({required this.baseUrl});
 
   Map<String, String> get _headers => {
@@ -45,6 +53,10 @@ class RobotService {
         data = {'detail': response.body.trim()};
       }
     }
+    if (response.statusCode == 401 && !_authExpiredFired) {
+      _authExpiredFired = true;
+      _authExpired.add(null);
+    }
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(data['detail'] ?? 'Robot API returned HTTP ${response.statusCode}');
     }
@@ -55,6 +67,7 @@ class RobotService {
     final data = await _request('POST', '/auth/login', body: {'username': username, 'password': password});
     _token = data['access_token']?.toString();
     role = data['role']?.toString();
+    _authExpiredFired = false;
   }
 
   void connect() {
