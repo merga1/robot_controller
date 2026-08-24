@@ -341,12 +341,12 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       await widget.service.cancelNavigation();
       final res = await widget.service.enableTeleop(true);
+      if (!mounted) return;
       setState(() => _joystickActive = true);
       final qosBad = res['qos_compatible'] == false || res['relay_best_effort'] == true;
-      final title = qosBad
-          ? 'QoS BLOCKED — robot will not move'
-          : 'Joystick armed — now DRAG the pad';
-      await _showTeleopPopup(res, title: title);
+      if (qosBad) {
+        await _showTeleopPopup(res, title: 'QoS BLOCKED — robot will not move');
+      }
     } catch (e) {
       setState(() => _actionError = e.toString().replaceFirst('Exception: ', ''));
     }
@@ -369,29 +369,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _sendCmdVelTick() {
-    widget.service.sendCmdVel(_lastLinear, _lastAngular).then((res) {
-      if (!mounted || _joystickDebugShown) return;
-      if (_lastLinear.abs() < 0.05 && _lastAngular.abs() < 0.05) return;
-      _joystickDebugShown = true;
-      final bridgeOk = res['bridge_ok'] == true;
-      final hasSub = res['cmd_vel_subscriber'] == true || res['bridge_listening'] == true;
-      final hubReady = res['hub_ready'] == true;
-      final relayOk = res['relay_alive'] == true;
-      final armed = res['teleop_armed'] == true || _joystickActive;
-      final units = res['cmd_vel_units']?.toString() ?? '';
-      final rosLinear = (res['linear'] as num?)?.toDouble() ?? 0.0;
-      var title = bridgeOk && hasSub && armed && relayOk
-          ? 'Joystick sending cmd_vel'
-          : 'Joystick active — robot may NOT move';
-      if (units == 'rpm' && _lastLinear.abs() > 0.05 && rosLinear.abs() < 1.0) {
-        title = 'Wrong speed scale — ROS linear=$rosLinear (need ~10 RPM)';
-      } else if (res['stats_linear'] != null &&
-          _lastLinear.abs() > 0.05 &&
-          (res['stats_linear'] as num).abs() < 0.01) {
-        title = 'Relay stuck at 0 — redeploy Pi backend (state file fix)';
-      }
-      _showTeleopPopup(res, title: title);
-    }).ignore();
+    widget.service.sendCmdVel(_lastLinear, _lastAngular).catchError((_) {});
   }
 
   Future<void> _onJoystickRelease() async {
@@ -805,7 +783,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 8),
             const Text(
-              'Pi runs gamepad.py + tablet /cmd_vel. After READY: Enable motors → JOYSTICK.',
+              'Quick Start: 1. Tap START → 2. Wait for READY → 3. Tap JOYSTICK → 4. Drag pad to drive immediately.',
               style: TextStyle(fontSize: 11, color: AppColors.textSecondary),
             ),
           ],

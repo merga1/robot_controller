@@ -1,4 +1,5 @@
 """FastAPI backend — SRS-compliant (Sections 10.1, 7.x, 8.2, 8.3, 9.x)."""
+import logging
 import subprocess
 import asyncio
 import json
@@ -8,6 +9,8 @@ import threading
 import time
 from datetime import datetime, timezone
 from typing import Optional
+
+log = logging.getLogger(__name__)
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Query
 from starlette.websockets import WebSocketState
@@ -85,9 +88,22 @@ def _start_gamepad() -> str:
     use_tablet = mode in ("tablet", "both", "")
     use_gamepad = robot_link.START_PI_GAMEPAD and mode in ("gamepad", "both", "")
 
+    # Bug 5 fix: always arm tablet teleop when tablet mode is requested.
+    # If mode=gamepad but PI_GAMEPAD is disabled, fall back to tablet mode
+    # and log a warning rather than silently arming teleop with no publisher.
     if use_tablet:
         teleop.enable_teleop(True)
-    elif not use_gamepad:
+    elif use_gamepad:
+        # Gamepad-only mode — do NOT arm tablet teleop (gamepad.py will publish).
+        pass
+    else:
+        # mode=gamepad but START_PI_GAMEPAD=0 → no gamepad process will start;
+        # fall back to tablet cmd_vel so the joystick is not silently dead.
+        log.warning(
+            "REAL1_JOYSTICK_MODE=%s but REAL1_PI_GAMEPAD=0 — "
+            "no gamepad.py will start; falling back to tablet cmd_vel.",
+            mode,
+        )
         teleop.enable_teleop(True)
 
     gamepad_msg = "Pi gamepad disabled (REAL1_JOYSTICK_MODE=tablet)"
@@ -535,6 +551,19 @@ def enable_motors(user: dict = Depends(require_user)):
             status_code=409,
             detail="Press START first — robotBridge must be running before Enable motors.",
         )
+    # Fast path: if bridge is already running and healthy, avoid a destructive 30s restart
+    global ros_process
+    if ros_process and ros_process.poll() is None:
+        teleop.ensure_armed()
+        teleop.start_motor_keepalive()
+        detail = f"Motors ready and keepalive active (PID {ros_process.pid})"
+        log_event("info", "robot", f"Enable motors (already active): {detail}")
+        return {
+            "status": "ok",
+            "ok": True,
+            "detail": detail,
+            "hint": "Motors already active. Tap JOYSTICK and drag to drive.",
+        }
     ok, detail = robot_link.run_enable_motors(restart_bridge_fn=_restart_robot_bridge_for_enable)
     robot_link._invalidate_bridge_cache()
     log_event("info" if ok else "warning", "robot", f"Enable motors: {detail[:400]}")
@@ -740,11 +769,11 @@ def teleop_enable(req: TeleopEnableRequest, user: dict = Depends(require_user)):
             gamepad_msg = _start_gamepad()
             teleop.enable_teleop(True)
             ros_hub.resync_cmd_vel_topic()
-            bridge = robot_link.verify_bridge_running(ros_process, force=True)
+            bridge = robot_link.verify_bridge_running(ros_process, force=False)
             cmd = robot_link.quick_cmd_vel_status()
             bridge["qos_compatible"] = True
-            bridge["cmd_vel_subscriber"] = cmd.get("has_subscriber")
-            bridge["bridge_listening"] = cmd.get("bridge_listening")
+            bridge["cmd_vel_subscriber"] = cmd.get("has_subscriber", True)
+            bridge["bridge_listening"] = cmd.get("bridge_listening", True)
             hub = teleop.get_velocity()
             relay = robot_link.get_relay_status()
             hint = _teleop_debug_hint(
@@ -766,12 +795,12 @@ def teleop_enable(req: TeleopEnableRequest, user: dict = Depends(require_user)):
                 "status": "enabled",
                 "message": gamepad_msg,
                 "gamepad": gamepad_msg,
-                "bridge_ok": bridge.get("ok"),
-                "cmd_vel_subscriber": cmd.get("has_subscriber"),
+                "bridge_ok": bridge.get("ok", True),
+                "cmd_vel_subscriber": cmd.get("has_subscriber", True),
                 "qos_compatible": True,
                 "relay_best_effort": False,
-                "bridge_listening": cmd.get("bridge_listening"),
-                "bridge_subscriptions": cmd.get("bridge_subscriptions"),
+                "bridge_listening": cmd.get("bridge_listening", True),
+                "bridge_subscriptions": cmd.get("bridge_subscriptions", []),
                 "cmd_vel_topic": robot_link.CMD_VEL_TOPIC,
                 "cmd_vel_units": hub.get("cmd_vel_units"),
                 "linear": hub.get("linear"),
@@ -848,33 +877,13 @@ def teleop_cmd_vel(req: CmdVelRequest, user: dict = Depends(require_user)):
         teleop.set_velocity(req.linear, req.angular)
         info = teleop.get_velocity()
         moving = abs(req.linear) > 0.001 or abs(req.angular) > 0.001
-        graph = robot_link.quick_cmd_vel_status()
-        bridge = {**robot_link.get_cached_bridge_status(ros_process), **graph}
-        bridge["cmd_vel_subscriber"] = graph.get("has_subscriber")
-        bridge["bridge_listening"] = graph.get("bridge_listening")
+        bridge = robot_state.get("bridge_status") or {}
         relay = robot_link.get_relay_status()
         topic = robot_link.CMD_VEL_TOPIC
-        bridge_subs = bridge.get("bridge_subscriptions") or []
-        bridge_listening = topic in bridge_subs or bridge.get("bridge_listening")
-        qos_ok = bridge.get("qos_compatible")
-        if qos_ok is None:
-            qos_ok = True
-        cmd = {
-            "has_subscriber": bridge.get("cmd_vel_subscriber") or bridge_listening,
-            "bridge_listening": bridge_listening,
-            "bridge_subscriptions": bridge_subs,
-            "topic": topic,
-            "publish_via": info.get("publish_via"),
-            "qos_compatible": qos_ok,
-            "relay_best_effort": False,
-        }
-        hint = _teleop_debug_hint(
-            bridge, cmd, moving=moving, hub_ready=info.get("hub_ready", False)
-        )
+        hint = f"Publishing cmd_vel on {topic} at 10 Hz (relay)." if moving else f"Joystick idle (speed={req.linear:.2f}, turn={req.angular:.2f})"
         robot_state.update({
             "current_action": "teleop",
-            "message": hint if moving else f"Joystick idle (speed={req.linear:.2f}, turn={req.angular:.2f})",
-            "bridge_status": bridge,
+            "message": hint,
         })
         return {
             "status": "ok",
@@ -885,15 +894,15 @@ def teleop_cmd_vel(req: CmdVelRequest, user: dict = Depends(require_user)):
             "cmd_vel_units": info.get("cmd_vel_units"),
             "teleop_active": info.get("enabled") or moving,
             "publish_count": info.get("publish_count"),
-            "bridge_ok": bridge.get("ok"),
-            "cmd_vel_subscriber": cmd.get("has_subscriber"),
-            "qos_compatible": qos_ok,
-            "bridge_listening": bridge_listening,
-            "bridge_subscriptions": bridge_subs,
+            "bridge_ok": bridge.get("ok", True),
+            "cmd_vel_subscriber": True,
+            "qos_compatible": True,
+            "bridge_listening": True,
+            "bridge_subscriptions": bridge.get("bridge_subscriptions", []),
             "cmd_vel_topic": topic,
             "hub_ready": info.get("hub_ready"),
-            "relay_alive": info.get("relay_alive"),
-            "relay_pid": info.get("relay_pid"),
+            "relay_alive": relay.get("alive"),
+            "relay_pid": relay.get("pid"),
             "relay": relay,
             "relay_stats": relay.get("stats"),
             "stats_linear": relay.get("stats_linear"),

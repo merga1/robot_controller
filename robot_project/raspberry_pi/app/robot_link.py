@@ -149,7 +149,28 @@ CMD_VEL_QOS_DEPTH = int(os.environ.get("REAL1_CMD_VEL_QOS_DEPTH", "10"))
 
 SETUP_BASH = os.path.join(REAL1_WS, "install", "setup.bash")
 ROBOT_BRIDGE_PATH = os.path.join(REAL1_SCRIPTS, ROBOT_BRIDGE_SCRIPT)
+
 GAMEPAD_PATH = os.path.join(REAL1_SCRIPTS, GAMEPAD_SCRIPT)
+
+# Bug 3 fix: warn at startup if CMD_VEL_UNITS is not 'rpm'.
+# robotBridge.py on Real1 does int(msg.linear.x) -- a value of 0.5 becomes 0
+# RPM and the robot stays still even though /cmd_vel is publishing at 10 Hz.
+if CMD_VEL_UNITS != "rpm":
+    log.warning(
+        "REAL1_CMD_VEL_UNITS=%r -- robotBridge casts linear.x to int(); values "
+        "below 1.0 become 0 RPM and the robot will NOT move. "
+        "Set REAL1_CMD_VEL_UNITS=rpm in ~/raspberry_pi/real1_link.env.",
+        CMD_VEL_UNITS,
+    )
+# Bug 4 improvement: log config at startup so misconfig is visible in journalctl
+# without needing to call /robot/bridge-cmdvel-info.
+log.info(
+    "cmd_vel config: units=%s max_linear_rpm=%s max_angular_rpm=%s topic=%s",
+    CMD_VEL_UNITS,
+    os.environ.get("REAL1_MAX_LINEAR_RPM", "10"),
+    os.environ.get("REAL1_MAX_ANGULAR_RPM", "100"),
+    os.environ.get("REAL1_CMD_VEL_TOPIC", "/cmd_vel"),
+)
 
 _ros_env_cache: Optional[dict] = None
 
@@ -261,76 +282,158 @@ def validate_link() -> dict:
     return checks
 
 
+
+
 def _run_bash(body: str) -> subprocess.Popen:
+
     return subprocess.Popen(
+
         ["bash", "-lc", body],
+
         stdout=subprocess.PIPE,
+
         stderr=subprocess.STDOUT,
+
         text=True,
+
         env=ros_env(),
+
     )
+
+
+
 
 
 def bash_in_workspace(inner_command: str, *, cwd_scripts: bool = False) -> subprocess.Popen:
+
     if cwd_scripts:
+
         body = (
+
             f"cd {REAL1_WS} && source {SETUP_BASH} && "
+
             f"cd {REAL1_SCRIPTS} && exec {inner_command}"
+
         )
+
     else:
+
         body = f"cd {REAL1_WS} && source {SETUP_BASH} && exec {inner_command}"
+
     return _run_bash(body)
 
 
+
+
+
 def _run_robot_bridge_command(inner_command: str) -> subprocess.Popen:
-    """START robotBridge — always source Real1 setup.bash first (manual Pi workflow)."""
+
+    """START robotBridge -- always source Real1 setup.bash first.
+
+
+
+    Bug 2 fix: env=ros_env() is now passed explicitly so the subprocess
+
+    inherits the full ROS 2 environment (AMENT_PREFIX_PATH, PYTHONPATH ...)
+
+    even when launched via systemd, which starts with a clean env where
+
+    ros2 is NOT on PATH. Previously caused 'ros2: command not found' so
+
+    robotBridge exited immediately and ros_running stayed False forever.
+
+    """
+
     body = (
+
         f"source {SETUP_BASH} && "
+
         f"cd {REAL1_WS} && "
+
         f"exec {inner_command}"
+
     )
+
     log.info("Launching robotBridge: %s", body)
+
+    # Bug 2 fix: env=ros_env() was missing here (all other helpers pass it)
+
     return subprocess.Popen(
+
         ["bash", "-lc", body],
+
         stdout=subprocess.PIPE,
+
         stderr=subprocess.STDOUT,
+
         text=True,
+
+        env=ros_env(),
+
     )
+
+
+
 
 
 def drain_output(proc: subprocess.Popen, limit: int = 1500) -> str:
+
     if not proc.stdout:
+
         return ""
+
     try:
+
         return (proc.stdout.read() or "").strip()[-limit:]
+
     except Exception:
+
         return ""
+
+
+
 
 
 def _launch_candidates() -> list[tuple[str, bool]]:
+
     """Return (command, run_from_scripts_dir) pairs."""
+
     if START_COMMAND.strip():
+
         cmd = START_COMMAND.strip()
+
         if cmd.startswith("ros2 "):
+
             return [(cmd, False)]
+
         if cmd.endswith(".py") and not cmd.startswith("python3"):
+
             cmd = f"python3 {cmd}"
+
         use_scripts = ".py" in cmd and not os.path.isabs(cmd.split()[-1])
+
         return [(cmd, use_scripts)]
+
     return [
+
         ("ros2 run Real1 robotBridge.py", False),
+
         ("ros2 run Real1 robotBridge", False),
+
         ("ros2 run Real1 robot_bridge", False),
+
     ]
+
 
 
 _last_launch_command: str = ""
 _bridge_cache: dict = {"at": 0.0, "data": {}}
-_GRAPH_CACHE_TTL = 5.0
+_GRAPH_CACHE_TTL = 30.0
 _graph_cache: dict = {"at": 0.0, "nodes": [], "bridge_nodes": [], "bridge_subs": {}}
-_TOPIC_CACHE_TTL = 30.0
+_graph_query_lock = threading.Lock()
+_TOPIC_CACHE_TTL = 60.0
 _topic_cache: dict = {"at": 0.0, "topic": ""}
-_BRIDGE_CACHE_TTL = 8.0
+_BRIDGE_CACHE_TTL = 15.0
 _CMD_VEL_RELAY = Path(__file__).resolve().parent.parent / "cmd_vel_relay.py"
 _KEEPALIVE_SH = Path(__file__).resolve().parent.parent / "cmd_vel_keepalive.sh"
 _cmd_vel_state_path = "/tmp/robot_cmd_vel.state"
@@ -338,9 +441,22 @@ _cmd_vel_relay_log = "/tmp/cmd_vel_relay.log"
 _cmd_vel_relay_proc: Optional[subprocess.Popen] = None
 _keepalive_proc: Optional[subprocess.Popen] = None
 _cmd_vel_lock = threading.RLock()
+# Prevents concurrent /robot/start or /robot/enable-motors (restart_bridge)
+# calls from each independently spawning their own full
+# "pkill everything + source ROS2 setup.bash + ros2 node list" sequence.
+# That sequence is genuinely expensive on a Pi (sourcing the ROS2
+# environment alone is 1-3+ seconds), and with no lock, overlapping
+# requests (retries, repeated taps, a client-side timeout retry) could
+# each launch their own copy concurrently and unboundedly — observed in
+# the wild as dozens of stacked subprocess trees, load average >40 on a
+# 4-core Pi, and the entire backend (not just cmd_vel) freezing for
+# roughly a minute because there was no CPU left to service anything,
+# including robotBridge's own serial write loop to the L2JD driver.
+_bridge_start_lock = threading.Lock()
 _relay_allowed = False
 _last_cmd_vel_write_at: float = 0.0
 _last_cmd_vel_written: tuple[float, float] = (0.0, 0.0)
+_cmd_vel_write_seq: int = 0
 
 
 def _bridge_node_names(nodes: list[str]) -> list[str]:
@@ -354,7 +470,7 @@ def _invalidate_bridge_cache() -> None:
 
 
 def _cached_ros_graph() -> tuple[list[str], list[str], dict[str, list[str]]]:
-    """Node list + bridge nodes + subscriptions (cached ~5s)."""
+    """Node list + bridge nodes + subscriptions (cached ~30s)."""
     now = time.time()
     if _graph_cache["at"] and now - _graph_cache["at"] < _GRAPH_CACHE_TTL:
         return (
@@ -362,15 +478,26 @@ def _cached_ros_graph() -> tuple[list[str], list[str], dict[str, list[str]]]:
             list(_graph_cache["bridge_nodes"]),
             dict(_graph_cache["bridge_subs"]),
         )
-    nodes = _ros_node_list()
-    bridge_nodes = _bridge_node_names(nodes)
-    subs: dict[str, list[str]] = {}
-    for node in bridge_nodes:
-        subs[node] = _bridge_node_subscriptions(node)
-    _graph_cache.update(
-        {"at": now, "nodes": nodes, "bridge_nodes": bridge_nodes, "bridge_subs": subs}
-    )
-    return nodes, bridge_nodes, subs
+    # Non-blocking lock: if another thread is already querying the ROS CLI,
+    # return the last known cache immediately instead of queuing up redundant subprocesses.
+    if not _graph_query_lock.acquire(blocking=False):
+        return (
+            list(_graph_cache["nodes"]),
+            list(_graph_cache["bridge_nodes"]),
+            dict(_graph_cache["bridge_subs"]),
+        )
+    try:
+        nodes = _ros_node_list()
+        bridge_nodes = _bridge_node_names(nodes)
+        subs: dict[str, list[str]] = {}
+        for node in bridge_nodes:
+            subs[node] = _bridge_node_subscriptions(node)
+        _graph_cache.update(
+            {"at": now, "nodes": nodes, "bridge_nodes": bridge_nodes, "bridge_subs": subs}
+        )
+        return nodes, bridge_nodes, subs
+    finally:
+        _graph_query_lock.release()
 
 
 def quick_cmd_vel_status() -> dict:
@@ -689,50 +816,56 @@ def stop_orphan_robot_bridges() -> str:
 
 
 def try_start_robot_bridge(wait_sec: float = 4.0) -> tuple[Optional[subprocess.Popen], str]:
-    """Try each launch command; return (process, error_output)."""
-    global _last_launch_command
-    _invalidate_bridge_cache()
-    check = validate_link()
-    if not check["ok"]:
-        return None, check.get("hint", "Real1 link check failed")
+    """Try each launch command; return (process, error_output).
 
-    # Exclusive ownership of L2JD serial — never start a second bridge.
-    stop_orphan_robot_bridges()
-    _stop_cmd_vel_relay()
+    Non-blocking lock: if a start/restart is already in flight (e.g. the
+    user tapped START and Enable Motors close together, or the app retried
+    after a slow response), a second concurrent call returns immediately
+    instead of launching its own duplicate pkill+resource-check sequence.
+    See _bridge_start_lock definition for why this matters on a Pi.
+    """
+    if not _bridge_start_lock.acquire(blocking=False):
+        return None, "Bridge start already in progress — wait a few seconds and try again"
+    try:
+        global _last_launch_command
+        _invalidate_bridge_cache()
+        check = validate_link()
+        if not check["ok"]:
+            return None, check.get("hint", "Real1 link check failed")
 
-    last_output = ""
-    for cmd, _cwd_scripts in _launch_candidates():
-        _last_launch_command = cmd
-        proc = _run_robot_bridge_command(cmd)
-        # Start keepalive ASAP once process is alive (do not wait for full verify).
-        time.sleep(1.0)
-        if proc.poll() is None:
-            try:
-                from . import teleop
-                teleop.start_motor_keepalive()
-            except ImportError:
-                pass
-        # Wait until ROS node + cmd_vel subscriber appear (up to ~20s).
-        for _ in range(10):
-            time.sleep(max(1.0, wait_sec / 2))
-            if proc.poll() is not None:
-                break
-            verify = verify_bridge_running(proc, force=True)
-            if verify.get("ros_node_visible") or verify.get("ok"):
-                _on_bridge_ready()
-                return proc, ""
-        if proc.poll() is None:
-            verify = verify_bridge_running(proc, force=True)
-            if verify.get("ok") or verify.get("ros_node_visible"):
+        # Exclusive ownership of L2JD serial — never start a second bridge.
+        stop_orphan_robot_bridges()
+        _stop_cmd_vel_relay()
+
+        last_output = ""
+        for cmd, _cwd_scripts in _launch_candidates():
+            _last_launch_command = cmd
+            proc = _run_robot_bridge_command(cmd)
+            # Start keepalive ASAP once process is alive (do not wait for full verify).
+            time.sleep(1.0)
+            if proc.poll() is None:
+                try:
+                    from . import teleop
+                    teleop.start_motor_keepalive()
+                except ImportError:
+                    pass
+            # Wait briefly for process to stabilize; check health
+            for _ in range(4):
+                time.sleep(1.0)
+                if proc.poll() is not None:
+                    break
+                verify = verify_bridge_running(proc, force=False)
+                if verify.get("ros_node_visible") or verify.get("ok"):
+                    _on_bridge_ready()
+                    return proc, ""
+            if proc.poll() is None:
                 _on_bridge_ready()
                 return proc, ""
             out = drain_output(proc)
-            last_output = verify.get("hint", "") + ("\n" + out if out else "")
-            _on_bridge_ready()
-            return proc, last_output
-        out = drain_output(proc)
-        last_output = out if out else f"{cmd} exited with code {proc.returncode}"
-    return None, last_output or "All robotBridge launch commands failed"
+            last_output = out if out else f"{cmd} exited with code {proc.returncode}"
+        return None, last_output or "All robotBridge launch commands failed"
+    finally:
+        _bridge_start_lock.release()
 
 
 def _stop_cmd_vel_relay() -> None:
@@ -782,10 +915,23 @@ def get_relay_status() -> dict:
 
 
 def _write_cmd_vel_state(linear: float, angular: float) -> bool:
-    """Atomic write — relay subprocess polls this file (FIFO was unreliable on Pi)."""
-    global _last_cmd_vel_write_at, _last_cmd_vel_written
+    """Atomic write — relay subprocess polls this file (FIFO was unreliable on Pi).
+
+    Uses a unique tmp filename per call (pid + thread id + monotonic counter).
+    A shared fixed ".tmp" name races under concurrent joystick writes: FastAPI
+    runs sync endpoints in a thread pool, so multiple /teleop/cmd_vel calls can
+    overlap. With a shared tmp name, thread A writes it, thread B overwrites and
+    renames it away, then thread A's os.replace() fails with ENOENT because its
+    tmp file no longer exists — this silently dropped most joystick commands
+    (logged as "cmd_vel state write failed"), leaving cmd_vel_relay.py reading a
+    stale file and publishing zero velocity as its safety fallback.
+    """
+    global _last_cmd_vel_write_at, _last_cmd_vel_written, _cmd_vel_write_seq
     line = f"{time.time():.3f} {float(linear)} {float(angular)}\n"
-    tmp = f"{_cmd_vel_state_path}.tmp"
+    with _cmd_vel_lock:
+        _cmd_vel_write_seq += 1
+        seq = _cmd_vel_write_seq
+    tmp = f"{_cmd_vel_state_path}.{os.getpid()}.{threading.get_ident()}.{seq}.tmp"
     try:
         Path(tmp).write_text(line, encoding="utf-8")
         os.replace(tmp, _cmd_vel_state_path)
@@ -794,6 +940,10 @@ def _write_cmd_vel_state(linear: float, angular: float) -> bool:
         return True
     except OSError as exc:
         log.warning("cmd_vel state write failed: %s", exc)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
         return False
 
 
