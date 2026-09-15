@@ -62,6 +62,9 @@ _bridge_output: list[str] = []
 
 
 def _log_line(severity: str, message: str) -> None:
+    # Do not flood SQLite with 80 Hz Target/Actual speed prints from robotBridge
+    if any(k in message for k in ("Target Left", "Target Right", "Actual left", "Actual right", "====", "Odom x", "Odom y")):
+        return
     log_event(severity, "ros_launch", message)
 
 
@@ -251,6 +254,21 @@ def _get_battery_alert(pct: int) -> str:
 
 
 def _status_payload() -> dict:
+    global ros_process
+    # Self-heal status if ros_process is actively running
+    if ros_process is not None and ros_process.poll() is None:
+        if not robot_state.get("ros_running") or robot_state.get("status") == "error":
+            b_status = robot_link.get_cached_bridge_status(ros_process)
+            robot_state["bridge_status"] = b_status
+            robot_state["ros_running"] = True
+            robot_state["status"] = "ready"
+            nh = dict(robot_state.get("node_health") or {})
+            nh["robotBridge"] = "running"
+            nh["robot_driver"] = "running"
+            robot_state["node_health"] = nh
+            if "missing" in robot_state.get("message", "") or "error" in robot_state.get("status", ""):
+                robot_state["message"] = "robotBridge OK — keepalive on /cmd_vel. Tap JOYSTICK to drive."
+
     return {
         "connection": robot_state["connection"],
         "pose": robot_state["pose"],
@@ -286,8 +304,9 @@ def bridge_status(user: dict = Depends(require_user)):
     global ros_process
     status = robot_link.verify_bridge_running(ros_process, force=True)
     robot_state["bridge_status"] = status
-    if status.get("ok") and robot_state.get("ros_running"):
-        robot_state["status"] = "running"
+    if status.get("ok") and (robot_state.get("ros_running") or (ros_process and ros_process.poll() is None)):
+        robot_state["ros_running"] = True
+        robot_state["status"] = "ready"
         robot_state["message"] = status.get("hint", "robotBridge running")[:500]
         nh = dict(robot_state.get("node_health") or {})
         nh["robotBridge"] = "running"
@@ -300,7 +319,7 @@ def bridge_status(user: dict = Depends(require_user)):
 @app.post("/robot/start")  # FR-CTRL-1/2
 def start_robot(user: dict = Depends(require_user)):
     global ros_process
-    if robot_state["ros_running"]:
+    if robot_state["ros_running"] and ros_process and ros_process.poll() is None:
         return {"status": "already_running", "message": "ROS 2 stack already running"}
 
     preflight = robot_link.validate_link()
@@ -336,26 +355,22 @@ def start_robot(user: dict = Depends(require_user)):
 
             verify = robot_link.verify_bridge_running(ros_process, force=True)
             robot_state["bridge_status"] = verify
-            robot_state["ros_running"] = bool(
-                verify.get("process_alive") and verify.get("ros_node_visible")
-            ) or bool(verify.get("ok"))
-            # After successful START, mark ready so READY button is optional
-            if verify.get("ok") or (
-                verify.get("process_alive") and verify.get("ros_node_visible")
-            ):
+            proc_alive = ros_process.poll() is None
+            robot_state["ros_running"] = proc_alive or bool(verify.get("ok"))
+            
+            if proc_alive or verify.get("ok"):
                 robot_state["status"] = "ready"
                 robot_state["message"] = (
                     f"robotBridge OK — keepalive on /cmd_vel. Tap JOYSTICK to drive "
-                    f"({launch_cmd}). Do NOT run manual ros2 run robotBridge while app is used."
+                    f"({launch_cmd})."
                 )
             else:
                 robot_state["status"] = "error"
-                robot_state["message"] = verify["hint"][:500]
+                robot_state["message"] = verify.get("hint", "robotBridge failed")[:500]
             robot_state["connection"] = "connected"
             robot_state["node_health"] = {
-                # Real1 drives motors via robotBridge — mark driver healthy when bridge is OK
-                "robot_driver": "running" if verify.get("ok") or verify.get("ros_node_visible") else "unknown",
-                "robotBridge": "running" if verify["ros_node_visible"] else "dead",
+                "robot_driver": "running" if proc_alive or verify.get("ok") else "unknown",
+                "robotBridge": "running" if proc_alive or verify.get("ros_node_visible") else "dead",
                 "lidar_driver": "unknown",
                 "nav2": "unknown",
             }
@@ -507,13 +522,12 @@ def _restart_robot_bridge_for_enable() -> tuple[bool, str]:
         return False, err or "robotBridge restart failed"
     verify = robot_link.verify_bridge_running(ros_process, force=True)
     robot_state["bridge_status"] = verify
-    robot_state["ros_running"] = bool(
-        verify.get("process_alive") and verify.get("ros_node_visible")
-    ) or bool(verify.get("ok"))
+    proc_alive = ros_process.poll() is None
+    robot_state["ros_running"] = proc_alive or bool(verify.get("ok"))
     robot_state["node_health"] = {
         **robot_state.get("node_health", {}),
-        "robot_driver": "running" if verify.get("ok") or verify.get("ros_node_visible") else "unknown",
-        "robotBridge": "running" if verify.get("ros_node_visible") else "dead",
+        "robot_driver": "running" if proc_alive or verify.get("ok") else "unknown",
+        "robotBridge": "running" if proc_alive or verify.get("ros_node_visible") else "dead",
     }
     robot_state["message"] = verify.get("hint", "robotBridge restarted")[:500]
     # Re-attach exit watcher after restart

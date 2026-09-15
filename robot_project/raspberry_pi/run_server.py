@@ -6,12 +6,12 @@ import sys
 def _preflight() -> None:
     """Fail fast if the Pi deployment is missing updated app modules.
 
-    Checks specifically target functions that were absent from an older,
-    stale snapshot of app/ (pre RPM-unit-conversion, pre cmd_vel-relay,
+    Checks specifically target functions that were absent from older,
+    stale snapshots of app/ (pre RPM-unit-conversion, pre cmd_vel-relay,
     pre motor-keepalive) that once caused the robot to report "connected"
-    while never actually sending a nonzero cmd_vel to robotBridge. A weaker
-    version of this check (testing only attribute names common to both old
-    and new code) could not catch that regression — these names can't.
+    while never actually sending a nonzero cmd_vel to the articubot_one stack.
+    A weaker version of this check (testing only attribute names common to both
+    old and new code) could not catch that regression — these names can't.
     """
     required = {
         "app.robot_link": (

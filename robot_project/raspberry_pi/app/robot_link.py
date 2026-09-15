@@ -1,4 +1,4 @@
-"""Link to the existing Real1 workspace on the Pi — no Real1 code lives in this repo."""
+"""Link to the existing articubot_one workspace on the Pi — no robot code lives in this repo."""
 import logging
 import os
 import re
@@ -28,18 +28,19 @@ _load_link_file()
 
 
 def _candidate_real1_workspaces() -> list[str]:
-    """delv and abpi share the Pi — try both homes plus current user."""
+    """Return candidate articubot_one workspace paths to probe."""
     home = os.path.expanduser("~")
-    users = []
-    for u in (os.environ.get("USER") or "", os.environ.get("LOGNAME") or "", "abpi", "delv"):
-        if u and u not in users:
-            users.append(u)
     candidates: list[str] = []
     configured = os.environ.get("REAL1_WS", "").strip()
     if configured:
         candidates.append(os.path.expanduser(configured))
-    for u in users:
-        candidates.append(f"/home/{u}/Real1")
+    # articubot_one1 is the primary workspace under /home/delv
+    candidates.append("/home/delv/articubot_one1")
+    candidates.append(os.path.join(home, "articubot_one1"))
+    # Legacy Real1 fallbacks (kept so old installs still work)
+    for u in (os.environ.get("USER") or "", os.environ.get("LOGNAME") or "", "abpi", "delv"):
+        if u:
+            candidates.append(f"/home/{u}/Real1")
     candidates.append(os.path.join(home, "Real1"))
     # De-dupe while preserving order
     seen: set[str] = set()
@@ -52,65 +53,43 @@ def _candidate_real1_workspaces() -> list[str]:
 
 
 def _scripts_dir_for_ws(ws: str) -> str:
-    bridge_name = os.environ.get("REAL1_ROBOT_BRIDGE_SCRIPT", "robotBridge.py")
+    bridge_name = os.environ.get("REAL1_ROBOT_BRIDGE_SCRIPT", "")
     configured = os.environ.get("REAL1_SCRIPTS", "").strip()
     if configured:
         conf = os.path.expanduser(configured)
-        # Use configured scripts only if they belong to this workspace and contain the bridge.
         if conf.startswith(ws.rstrip("/") + "/") or conf.rstrip("/") == ws.rstrip("/"):
-            if os.path.isfile(os.path.join(conf, bridge_name)):
+            if not bridge_name or os.path.isfile(os.path.join(conf, bridge_name)):
                 return conf
     for rel in (
+        os.path.join("src", "articubot_one", "scripts"),
         os.path.join("src", "Real1", "scripts"),
         os.path.join("src", "real1", "scripts"),
         "scripts",
     ):
         path = os.path.join(ws, rel)
-        if os.path.isfile(os.path.join(path, bridge_name)) or os.path.isdir(path):
+        if (bridge_name and os.path.isfile(os.path.join(path, bridge_name))) or os.path.isdir(path):
             return path
-    return os.path.join(ws, "src", "Real1", "scripts")
+    return os.path.join(ws, "src", "articubot_one", "scripts")
 
 
 def _resolve_real1_paths() -> tuple[str, str]:
-    """Pick the Real1 workspace that actually contains robotBridge.py (abpi or delv)."""
-    bridge_name = os.environ.get("REAL1_ROBOT_BRIDGE_SCRIPT", "robotBridge.py")
+    """Pick the articubot_one workspace that has install/setup.bash."""
     best_ws = ""
     best_scripts = ""
     for ws in _candidate_real1_workspaces():
         if not os.path.isdir(ws):
             continue
         scripts = _scripts_dir_for_ws(ws)
-        bridge = os.path.join(scripts, bridge_name)
         setup = os.path.join(ws, "install", "setup.bash")
-        if os.path.isfile(bridge):
+        if os.path.isfile(setup):
             best_ws, best_scripts = ws, scripts
-            if os.path.isfile(setup):
-                break
-        elif not best_ws and os.path.isfile(setup):
+            break
+        elif not best_ws and os.path.isdir(ws):
             best_ws, best_scripts = ws, scripts
     if not best_ws:
-        # Last resort: look for robotBridge.py under known Real1 trees only.
-        for base in ("/home/abpi/Real1", "/home/delv/Real1", os.path.join(os.path.expanduser("~"), "Real1")):
-            if not os.path.isdir(base):
-                continue
-            try:
-                for root, dirs, files in os.walk(base):
-                    # Skip heavy build dirs
-                    dirs[:] = [d for d in dirs if d not in ("install", "build", "log", ".git")]
-                    if bridge_name in files:
-                        scripts = root
-                        parts = Path(root).parts
-                        ws = base
-                        for i, part in enumerate(parts):
-                            if part.lower() == "real1":
-                                ws = str(Path(*parts[: i + 1]))
-                                break
-                        return ws, scripts
-            except OSError:
-                continue
-        best_ws = os.environ.get("REAL1_WS", "/home/abpi/Real1")
+        best_ws = os.environ.get("REAL1_WS", "/home/delv/articubot_one1")
         best_scripts = os.environ.get(
-            "REAL1_SCRIPTS", os.path.join(best_ws, "src", "Real1", "scripts")
+            "REAL1_SCRIPTS", os.path.join(best_ws, "src", "articubot_one", "scripts")
         )
     return best_ws, best_scripts
 
@@ -118,22 +97,23 @@ def _resolve_real1_paths() -> tuple[str, str]:
 REAL1_WS, REAL1_SCRIPTS = _resolve_real1_paths()
 os.environ["REAL1_WS"] = REAL1_WS
 os.environ["REAL1_SCRIPTS"] = REAL1_SCRIPTS
-log.info("Real1 paths: WS=%s SCRIPTS=%s", REAL1_WS, REAL1_SCRIPTS)
+log.info("articubot_one paths: WS=%s SCRIPTS=%s", REAL1_WS, REAL1_SCRIPTS)
 
-ROBOT_BRIDGE_SCRIPT = os.environ.get("REAL1_ROBOT_BRIDGE_SCRIPT", "robotBridge.py")
+ROBOT_BRIDGE_SCRIPT = os.environ.get("REAL1_ROBOT_BRIDGE_SCRIPT", "")
 GAMEPAD_SCRIPT = os.environ.get("REAL1_GAMEPAD_SCRIPT", "gamepad.py")
-START_COMMAND = os.environ.get("REAL1_START_CMD", "ros2 run Real1 robotBridge.py")
+# articubot_one uses ros2 launch; fallback to ros2 run for legacy Real1 installs
+START_COMMAND = os.environ.get("REAL1_START_CMD", "ros2 launch articubot_one master.launch.py")
 CMD_VEL_TOPIC = os.environ.get("REAL1_CMD_VEL_TOPIC", "/cmd_vel")
 READY_COMMAND = os.environ.get("REAL1_READY_CMD", "")
 ENABLE_MOTORS_COMMAND = os.environ.get("REAL1_ENABLE_MOTORS_CMD", "")
-# restart_bridge | command — Real1 enables motors inside robotBridge.py on startup
+# restart_bridge | command — articubot_one enables motors on launch startup
 ENABLE_MOTORS_MODE = os.environ.get("REAL1_ENABLE_MOTORS_MODE", "restart_bridge").strip().lower()
-# Scale cmd_vel before publish (used when REAL1_CMD_VEL_UNITS=ms)
+# Scale cmd_vel before publish
 CMD_VEL_LINEAR_SCALE = float(os.environ.get("REAL1_CMD_VEL_LINEAR_SCALE", "1.0"))
 CMD_VEL_ANGULAR_SCALE = float(os.environ.get("REAL1_CMD_VEL_ANGULAR_SCALE", "1.0"))
-# Real1 L2JD robotBridge uses RPM — tablet sends 0.05–0.5 m/s style values → int(0.5)=0!
-CMD_VEL_UNITS = os.environ.get("REAL1_CMD_VEL_UNITS", "rpm").strip().lower()
-MAX_LINEAR_RPM = float(os.environ.get("REAL1_MAX_LINEAR_RPM", "10"))
+# articubot_one expects standard ROS m/s on /cmd_vel
+CMD_VEL_UNITS = os.environ.get("REAL1_CMD_VEL_UNITS", "ms").strip().lower()
+MAX_LINEAR_RPM = float(os.environ.get("REAL1_MAX_LINEAR_RPM", "100"))
 MAX_ANGULAR_RPM = float(os.environ.get("REAL1_MAX_ANGULAR_RPM", "100"))
 TABLET_MAX_LINEAR = float(os.environ.get("REAL1_TABLET_MAX_LINEAR", "0.5"))
 TABLET_MAX_ANGULAR = float(os.environ.get("REAL1_TABLET_MAX_ANGULAR", "1.0"))
@@ -148,27 +128,17 @@ START_PI_GAMEPAD = os.environ.get("REAL1_PI_GAMEPAD", "0").strip().lower() in ("
 CMD_VEL_QOS_DEPTH = int(os.environ.get("REAL1_CMD_VEL_QOS_DEPTH", "10"))
 
 SETUP_BASH = os.path.join(REAL1_WS, "install", "setup.bash")
-ROBOT_BRIDGE_PATH = os.path.join(REAL1_SCRIPTS, ROBOT_BRIDGE_SCRIPT)
+# Extra workspace to source before SETUP_BASH (e.g. l2jd_ws for articubot_one).
+EXTRA_SETUP_BASH = os.environ.get("REAL1_EXTRA_SETUP", "/home/delv/l2jd_ws/install/setup.bash").strip()
+ROBOT_BRIDGE_PATH = os.path.join(REAL1_SCRIPTS, ROBOT_BRIDGE_SCRIPT) if ROBOT_BRIDGE_SCRIPT else ""
 
 GAMEPAD_PATH = os.path.join(REAL1_SCRIPTS, GAMEPAD_SCRIPT)
 
-# Bug 3 fix: warn at startup if CMD_VEL_UNITS is not 'rpm'.
-# robotBridge.py on Real1 does int(msg.linear.x) -- a value of 0.5 becomes 0
-# RPM and the robot stays still even though /cmd_vel is publishing at 10 Hz.
-if CMD_VEL_UNITS != "rpm":
-    log.warning(
-        "REAL1_CMD_VEL_UNITS=%r -- robotBridge casts linear.x to int(); values "
-        "below 1.0 become 0 RPM and the robot will NOT move. "
-        "Set REAL1_CMD_VEL_UNITS=rpm in ~/raspberry_pi/real1_link.env.",
-        CMD_VEL_UNITS,
-    )
-# Bug 4 improvement: log config at startup so misconfig is visible in journalctl
-# without needing to call /robot/bridge-cmdvel-info.
 log.info(
-    "cmd_vel config: units=%s max_linear_rpm=%s max_angular_rpm=%s topic=%s",
+    "cmd_vel config: units=%s linear_scale=%s angular_scale=%s topic=%s",
     CMD_VEL_UNITS,
-    os.environ.get("REAL1_MAX_LINEAR_RPM", "10"),
-    os.environ.get("REAL1_MAX_ANGULAR_RPM", "100"),
+    CMD_VEL_LINEAR_SCALE,
+    CMD_VEL_ANGULAR_SCALE,
     os.environ.get("REAL1_CMD_VEL_TOPIC", "/cmd_vel"),
 )
 
@@ -176,16 +146,22 @@ _ros_env_cache: Optional[dict] = None
 
 
 def ros_env() -> dict:
-    """Environment with Real1 workspace sourced (cached)."""
+    """Environment with both articubot_one workspaces sourced (l2jd_ws first, cached)."""
     global _ros_env_cache
     if _ros_env_cache is not None:
         return _ros_env_cache.copy()
     env = os.environ.copy()
     env.setdefault("ROS_DOMAIN_ID", "0")
+    # Build a compound source command: source l2jd_ws first, then articubot_one1.
+    source_cmds = []
+    if EXTRA_SETUP_BASH and os.path.isfile(EXTRA_SETUP_BASH):
+        source_cmds.append(f"source {EXTRA_SETUP_BASH}")
     if os.path.isfile(SETUP_BASH):
+        source_cmds.append(f"source {SETUP_BASH}")
+    if source_cmds:
         try:
             proc = subprocess.run(
-                ["bash", "-lc", f"source {SETUP_BASH} && env"],
+                ["bash", "-lc", " && ".join(source_cmds) + " && env"],
                 capture_output=True,
                 text=True,
                 check=True,
@@ -196,14 +172,14 @@ def ros_env() -> dict:
                     key, _, value = line.partition("=")
                     env[key] = value
         except Exception as exc:
-            log.warning("Could not source %s: %s", SETUP_BASH, exc)
+            log.warning("Could not source ROS workspaces: %s", exc)
     _ros_env_cache = env
     return env.copy()
 
 
 def apply_ros_environment() -> bool:
-    """Merge Real1 ROS environment into the current process (before rclpy.init)."""
-    if not os.path.isfile(SETUP_BASH):
+    """Merge articubot_one ROS environments into the current process (before rclpy.init)."""
+    if not os.path.isfile(SETUP_BASH) and not os.path.isfile(EXTRA_SETUP_BASH):
         return False
     merged = ros_env()
     os.environ.update(merged)
@@ -243,42 +219,51 @@ def cmd_vel_publisher_qos():
 
 
 def validate_link() -> dict:
+    # With ros2 launch, ROBOT_BRIDGE_PATH may be empty — that is valid.
+    using_launch = "ros2 launch" in START_COMMAND
+    bridge_exists = (
+        True if using_launch
+        else (bool(ROBOT_BRIDGE_PATH) and os.path.isfile(ROBOT_BRIDGE_PATH))
+    )
     checks = {
         "real1_link_env": str(_LINK_FILE),
         "real1_link_env_exists": _LINK_FILE.is_file(),
         "workspace": REAL1_WS,
         "workspace_exists": os.path.isdir(REAL1_WS),
+        "extra_setup_bash": EXTRA_SETUP_BASH,
+        "extra_setup_bash_exists": os.path.isfile(EXTRA_SETUP_BASH),
         "setup_bash": SETUP_BASH,
         "setup_bash_exists": os.path.isfile(SETUP_BASH),
         "scripts_dir": REAL1_SCRIPTS,
         "scripts_dir_exists": os.path.isdir(REAL1_SCRIPTS),
-        "robot_bridge_script": ROBOT_BRIDGE_PATH,
-        "robot_bridge_exists": os.path.isfile(ROBOT_BRIDGE_PATH),
+        "robot_bridge_script": ROBOT_BRIDGE_PATH or "(ros2 launch — no single script)",
+        "robot_bridge_exists": bridge_exists,
+        "start_command": START_COMMAND,
+        "using_ros2_launch": using_launch,
         "gamepad_script": resolve_gamepad_path() or GAMEPAD_PATH,
         "gamepad_exists": resolve_gamepad_path() is not None,
-        "tried_homes": ["abpi", "delv", "current"],
+        "tried_homes": ["delv/articubot_one1", "delv/Real1", "current"],
     }
     checks["ok"] = all(
         checks[k]
         for k in (
             "workspace_exists",
             "setup_bash_exists",
-            "scripts_dir_exists",
-            "robot_bridge_exists",
         )
     )
     if not checks["real1_link_env_exists"]:
         checks["hint"] = f"Copy real1_link.env.example to {_LINK_FILE} on the Pi."
-    elif not checks["robot_bridge_exists"]:
+    elif not checks["extra_setup_bash_exists"]:
         checks["hint"] = (
-            f"robotBridge.py not found at {ROBOT_BRIDGE_PATH}. "
-            "Tried /home/abpi/Real1 and /home/delv/Real1. "
-            "Set REAL1_WS and REAL1_SCRIPTS in real1_link.env to the home that has Real1."
+            f"l2jd_ws setup not found at {EXTRA_SETUP_BASH}. "
+            "Build it: cd /home/delv/l2jd_ws && colcon build"
         )
     elif not checks["setup_bash_exists"]:
-        checks["hint"] = f"Run: cd {REAL1_WS} && colcon build"
+        checks["hint"] = (
+            f"articubot_one1 setup not found. Run: cd {REAL1_WS} && colcon build"
+        )
     else:
-        checks["hint"] = f"All Real1 paths OK ({REAL1_WS})."
+        checks["hint"] = f"All articubot_one paths OK ({REAL1_WS})."
     return checks
 
 
@@ -306,11 +291,14 @@ def _run_bash(body: str) -> subprocess.Popen:
 
 def bash_in_workspace(inner_command: str, *, cwd_scripts: bool = False) -> subprocess.Popen:
 
+    # Build source prefix: l2jd_ws first, then articubot_one1
+    _extra = f"source {EXTRA_SETUP_BASH} && " if EXTRA_SETUP_BASH and os.path.isfile(EXTRA_SETUP_BASH) else ""
+
     if cwd_scripts:
 
         body = (
 
-            f"cd {REAL1_WS} && source {SETUP_BASH} && "
+            f"cd {REAL1_WS} && {_extra}source {SETUP_BASH} && "
 
             f"cd {REAL1_SCRIPTS} && exec {inner_command}"
 
@@ -318,7 +306,7 @@ def bash_in_workspace(inner_command: str, *, cwd_scripts: bool = False) -> subpr
 
     else:
 
-        body = f"cd {REAL1_WS} && source {SETUP_BASH} && exec {inner_command}"
+        body = f"cd {REAL1_WS} && {_extra}source {SETUP_BASH} && exec {inner_command}"
 
     return _run_bash(body)
 
@@ -328,25 +316,23 @@ def bash_in_workspace(inner_command: str, *, cwd_scripts: bool = False) -> subpr
 
 def _run_robot_bridge_command(inner_command: str) -> subprocess.Popen:
 
-    """START robotBridge -- always source Real1 setup.bash first.
+    """START articubot_one — source both workspaces first.
 
 
 
-    Bug 2 fix: env=ros_env() is now passed explicitly so the subprocess
+    env=ros_env() is passed explicitly so the subprocess inherits the full
 
-    inherits the full ROS 2 environment (AMENT_PREFIX_PATH, PYTHONPATH ...)
+    ROS 2 environment (AMENT_PREFIX_PATH, PYTHONPATH ...) even when launched
 
-    even when launched via systemd, which starts with a clean env where
-
-    ros2 is NOT on PATH. Previously caused 'ros2: command not found' so
-
-    robotBridge exited immediately and ros_running stayed False forever.
+    via systemd, which starts with a clean env where ros2 is NOT on PATH.
 
     """
 
+    _extra = f"source {EXTRA_SETUP_BASH} && " if EXTRA_SETUP_BASH and os.path.isfile(EXTRA_SETUP_BASH) else ""
+
     body = (
 
-        f"source {SETUP_BASH} && "
+        f"{_extra}source {SETUP_BASH} && "
 
         f"cd {REAL1_WS} && "
 
@@ -354,22 +340,15 @@ def _run_robot_bridge_command(inner_command: str) -> subprocess.Popen:
 
     )
 
-    log.info("Launching robotBridge: %s", body)
-
-    # Bug 2 fix: env=ros_env() was missing here (all other helpers pass it)
-
+    log.info("Launching articubot_one: %s", body)
+    r_env = ros_env()
+    r_env["PYTHONUNBUFFERED"] = "1"
     return subprocess.Popen(
-
         ["bash", "-lc", body],
-
         stdout=subprocess.PIPE,
-
         stderr=subprocess.STDOUT,
-
         text=True,
-
-        env=ros_env(),
-
+        env=r_env,
     )
 
 
@@ -414,13 +393,10 @@ def _launch_candidates() -> list[tuple[str, bool]]:
 
         return [(cmd, use_scripts)]
 
+    # Default: articubot_one master launch
     return [
 
-        ("ros2 run Real1 robotBridge.py", False),
-
-        ("ros2 run Real1 robotBridge", False),
-
-        ("ros2 run Real1 robot_bridge", False),
+        ("ros2 launch articubot_one master.launch.py", False),
 
     ]
 
@@ -428,12 +404,12 @@ def _launch_candidates() -> list[tuple[str, bool]]:
 
 _last_launch_command: str = ""
 _bridge_cache: dict = {"at": 0.0, "data": {}}
-_GRAPH_CACHE_TTL = 30.0
+_GRAPH_CACHE_TTL = 4.0
 _graph_cache: dict = {"at": 0.0, "nodes": [], "bridge_nodes": [], "bridge_subs": {}}
 _graph_query_lock = threading.Lock()
-_TOPIC_CACHE_TTL = 60.0
+_TOPIC_CACHE_TTL = 30.0
 _topic_cache: dict = {"at": 0.0, "topic": ""}
-_BRIDGE_CACHE_TTL = 15.0
+_BRIDGE_CACHE_TTL = 2.0
 _CMD_VEL_RELAY = Path(__file__).resolve().parent.parent / "cmd_vel_relay.py"
 _KEEPALIVE_SH = Path(__file__).resolve().parent.parent / "cmd_vel_keepalive.sh"
 _cmd_vel_state_path = "/tmp/robot_cmd_vel.state"
@@ -444,14 +420,6 @@ _cmd_vel_lock = threading.RLock()
 # Prevents concurrent /robot/start or /robot/enable-motors (restart_bridge)
 # calls from each independently spawning their own full
 # "pkill everything + source ROS2 setup.bash + ros2 node list" sequence.
-# That sequence is genuinely expensive on a Pi (sourcing the ROS2
-# environment alone is 1-3+ seconds), and with no lock, overlapping
-# requests (retries, repeated taps, a client-side timeout retry) could
-# each launch their own copy concurrently and unboundedly — observed in
-# the wild as dozens of stacked subprocess trees, load average >40 on a
-# 4-core Pi, and the entire backend (not just cmd_vel) freezing for
-# roughly a minute because there was no CPU left to service anything,
-# including robotBridge's own serial write loop to the L2JD driver.
 _bridge_start_lock = threading.Lock()
 _relay_allowed = False
 _last_cmd_vel_write_at: float = 0.0
@@ -467,12 +435,15 @@ def _invalidate_bridge_cache() -> None:
     _bridge_cache["at"] = 0.0
     _bridge_cache["data"] = {}
     _graph_cache["at"] = 0.0
+    _graph_cache["nodes"] = []
+    _graph_cache["bridge_nodes"] = []
+    _graph_cache["bridge_subs"] = {}
 
 
-def _cached_ros_graph() -> tuple[list[str], list[str], dict[str, list[str]]]:
-    """Node list + bridge nodes + subscriptions (cached ~30s)."""
+def _cached_ros_graph(force: bool = False) -> tuple[list[str], list[str], dict[str, list[str]]]:
+    """Node list + bridge nodes + subscriptions (cached ~4s)."""
     now = time.time()
-    if _graph_cache["at"] and now - _graph_cache["at"] < _GRAPH_CACHE_TTL:
+    if not force and _graph_cache["at"] and now - _graph_cache["at"] < _GRAPH_CACHE_TTL:
         return (
             list(_graph_cache["nodes"]),
             list(_graph_cache["bridge_nodes"]),
@@ -619,6 +590,8 @@ def get_last_launch_command() -> str:
 def verify_bridge_running(proc: Optional[subprocess.Popen] = None, *, force: bool = False) -> dict:
     """Confirm robotBridge process + ROS node + cmd_vel subscriber (cached)."""
     now = time.time()
+    if force:
+        _invalidate_bridge_cache()
     if not force and _bridge_cache["data"] and now - _bridge_cache["at"] < _BRIDGE_CACHE_TTL:
         cached = dict(_bridge_cache["data"])
         if proc is not None:
@@ -629,17 +602,17 @@ def verify_bridge_running(proc: Optional[subprocess.Popen] = None, *, force: boo
                 cached["ok"] = False
                 cached["hint"] = "Launch process is not running — press START again."
         return cached
-    return _verify_bridge_running_now(proc)
+    return _verify_bridge_running_now(proc, force=force)
 
 
 def get_cached_bridge_status(proc: Optional[subprocess.Popen] = None) -> dict:
     return verify_bridge_running(proc, force=False)
 
 
-def _verify_bridge_running_now(proc: Optional[subprocess.Popen] = None) -> dict:
+def _verify_bridge_running_now(proc: Optional[subprocess.Popen] = None, *, force: bool = False) -> dict:
     """Fresh ROS graph check — uses cached node list when possible."""
     sync_cmd_vel_topic()
-    nodes, bridge_nodes, subs_map = _cached_ros_graph()
+    nodes, bridge_nodes, subs_map = _cached_ros_graph(force=force)
     cmd_info = quick_cmd_vel_status()
     process_alive = proc is not None and proc.poll() is None
     ros_node_visible = len(bridge_nodes) > 0
@@ -649,39 +622,33 @@ def _verify_bridge_running_now(proc: Optional[subprocess.Popen] = None) -> dict:
     bridge_subs = list(dict.fromkeys(bridge_subs))
     cmd_vel_subscriber = bool(cmd_info.get("has_subscriber"))
     bridge_listening = bool(cmd_info.get("bridge_listening"))
-    launched_via_ros2 = (_last_launch_command or "").strip().startswith("ros2 run")
+    # Accept both ros2 run and ros2 launch as valid start methods
+    launched_via_ros2 = (_last_launch_command or "").strip().startswith("ros2 ")
 
-    # Drive is OK if the ROS node is up. Process handle may be lost after
-    # Enable-motors restart — still allow teleop when the graph shows the node.
-    ok = (process_alive and ros_node_visible) or (
-        ros_node_visible and (cmd_vel_subscriber or bridge_listening)
-    )
-    if process_alive and ros_node_visible:
-        ok = True
+    # Drive is OK if process is alive OR the ROS node is up.
+    ok = process_alive or ros_node_visible
 
     if not process_alive and not ros_node_visible:
         hint = (
-            "Launch process is not running. Set REAL1_START_CMD=ros2 run Real1 robotBridge.py "
+            "Launch process is not running. Set REAL1_START_CMD=ros2 launch articubot_one master.launch.py "
             "in ~/raspberry_pi/real1_link.env and press START again."
         )
     elif not process_alive and ros_node_visible:
         hint = (
-            "robot_bridge ROS node is visible (process handle lost) — OK to drive. "
+            "articubot_one ROS nodes visible (process handle lost) — OK to drive. "
             "Tap JOYSTICK to arm cmd_vel."
         )
         ok = True
     elif not launched_via_ros2 and process_alive:
         hint = (
             f"Wrong launch: '{_last_launch_command}'. Must use "
-            "'ros2 run Real1 robotBridge.py' (not python3 robotBridge.py). "
-            "Update real1_link.env and press START."
+            "'ros2 launch articubot_one master.launch.py'. "
+            "Update REAL1_START_CMD in real1_link.env and press START."
         )
-    elif not ros_node_visible:
-        hint = (
-            f"Process PID {proc.pid if proc else '?'} is alive but ROS node robot_bridge "
-            f"is missing. Command used: {_last_launch_command or 'unknown'}. "
-            "Wait a few seconds or check Logs for robotBridge output."
-        )
+    elif process_alive and not ros_node_visible:
+        # Process is running, node registration is still finishing up
+        hint = f"articubot_one launch active (PID {proc.pid if proc else '?'}) — OK to drive."
+        ok = True
     elif not cmd_vel_subscriber and not bridge_listening:
         subs = []
         for node in bridge_nodes:
@@ -691,17 +658,16 @@ def _verify_bridge_running_now(proc: Optional[subprocess.Popen] = None) -> dict:
             f"robot_bridge is up but cmd_vel subscriber not confirmed yet.{sub_hint} "
             "Tap JOYSTICK and drag — or Enable motors if wheels stay stopped."
         )
-        # Still allow operate when node is up (graph checks are flaky under load).
         ok = True
     else:
-        hint = "robotBridge OK — ros2 run active, node visible, cmd_vel subscribed."
+        hint = "articubot_one OK — ros2 launch active, node visible, cmd_vel subscribed."
 
     result = {
         "ok": ok,
         "process_alive": process_alive,
         "pid": proc.pid if proc and process_alive else None,
         "launch_command": _last_launch_command,
-        "launched_via_ros2_run": launched_via_ros2,
+        "launched_via_ros2": launched_via_ros2,
         "ros_node_visible": ros_node_visible,
         "ros_bridge_nodes": bridge_nodes,
         "ros_nodes": nodes,
@@ -788,16 +754,17 @@ def stop_shell_keepalive() -> None:
 
 
 def stop_orphan_robot_bridges() -> str:
-    """Kill leftover robotBridge / relay processes so START owns the serial port.
+    """Kill leftover articubot_one launch / relay processes before a clean START.
 
-    A manual `ros2 run Real1 robotBridge.py` left running + app START causes
-    two bridges on the same L2JD bus → Communication loss + red driver LED.
+    A manual `ros2 launch articubot_one master.launch.py` left running + app START
+    can cause two robot stacks competing on the same hardware.
     """
     cmds = [
+        "pkill -f '[r]os2.*launch.*articubot_one' || true",
+        "pkill -f '[m]aster.launch.py' || true",
         "pkill -f '[r]obotBridge' || true",
         "pkill -f '[r]obot_bridge' || true",
         "pkill -f '[t]ablet_cmd_vel_relay' || true",
-        "pkill -f 'ros2 run Real1 robotBridge' || true",
     ]
     for c in cmds:
         try:
@@ -805,10 +772,9 @@ def stop_orphan_robot_bridges() -> str:
         except Exception as exc:
             log.warning("stop_orphan_robot_bridges: %s", exc)
     time.sleep(1.5)
-    # Confirm serial is free enough for a clean start
     left = _ros_node_list()
     leftovers = [n for n in left if re.search(r"robot[_]?bridge|tablet_cmd_vel_relay", n, re.I)]
-    msg = "Cleared orphan robotBridge/relay"
+    msg = "Cleared orphan articubot_one/relay processes"
     if leftovers:
         msg += f" (still visible in ROS graph: {leftovers} — wait a few seconds)"
     log.info(msg)
@@ -841,20 +807,20 @@ def try_start_robot_bridge(wait_sec: float = 4.0) -> tuple[Optional[subprocess.P
         for cmd, _cwd_scripts in _launch_candidates():
             _last_launch_command = cmd
             proc = _run_robot_bridge_command(cmd)
-            # Start keepalive ASAP once process is alive (do not wait for full verify).
-            time.sleep(1.0)
+            # Give L2JD driver setup on /dev/ttyAMA1 enough time to finish and register ROS node
+            time.sleep(1.5)
             if proc.poll() is None:
                 try:
                     from . import teleop
                     teleop.start_motor_keepalive()
                 except ImportError:
                     pass
-            # Wait briefly for process to stabilize; check health
-            for _ in range(4):
+            # Wait briefly for process to stabilize; check health with fresh cache
+            for _ in range(6):
                 time.sleep(1.0)
                 if proc.poll() is not None:
                     break
-                verify = verify_bridge_running(proc, force=False)
+                verify = verify_bridge_running(proc, force=True)
                 if verify.get("ros_node_visible") or verify.get("ok"):
                     _on_bridge_ready()
                     return proc, ""
@@ -863,7 +829,7 @@ def try_start_robot_bridge(wait_sec: float = 4.0) -> tuple[Optional[subprocess.P
                 return proc, ""
             out = drain_output(proc)
             last_output = out if out else f"{cmd} exited with code {proc.returncode}"
-        return None, last_output or "All robotBridge launch commands failed"
+        return None, last_output or "All articubot_one launch commands failed"
     finally:
         _bridge_start_lock.release()
 
@@ -998,8 +964,9 @@ def start_cmd_vel_relay() -> None:
             log.error("cmd_vel relay script missing: %s", relay)
             return
 
+        _extra_relay = f"source {EXTRA_SETUP_BASH} && " if EXTRA_SETUP_BASH and os.path.isfile(EXTRA_SETUP_BASH) else ""
         reader = (
-            f"source {SETUP_BASH} && "
+            f"{_extra_relay}source {SETUP_BASH} && "
             f"export REAL1_CMD_VEL_TOPIC={topic} && "
             f"export CMD_VEL_STATE={_cmd_vel_state_path} && "
             f"export REAL1_CMD_VEL_QOS_DEPTH={CMD_VEL_QOS_DEPTH} && "
@@ -1104,13 +1071,13 @@ def check_cmd_vel() -> dict:
             )
         elif not has_sub:
             qos_hint = (
-                f"robotBridge does not subscribe to {topic} — "
+                f"articubot_one does not subscribe to {topic} — "
                 f"bridge listens on: {bridge_subs or 'unknown'}. "
                 "Set REAL1_CMD_VEL_TOPIC in real1_link.env."
             )
         else:
             qos_hint = (
-                f"robotBridge listens on {topic} with matching QoS "
+                f"articubot_one listens on {topic} with matching QoS "
                 f"(relay={ 'tablet_cmd_vel_relay' in out })."
             )
         result.update(
@@ -1134,7 +1101,7 @@ def check_cmd_vel() -> dict:
 
 
 def convert_cmd_vel(linear: float, angular: float) -> tuple[float, float]:
-    """Convert tablet cmd_vel to units robotBridge expects (RPM for L2JD)."""
+    """Convert tablet cmd_vel to the units articubot_one expects on /cmd_vel."""
     linear = float(linear)
     angular = float(angular)
     if CMD_VEL_UNITS == "rpm":
@@ -1452,7 +1419,12 @@ def watch_process(
                     continue
                 if output_lines is not None:
                     output_lines.append(line)
+                    if len(output_lines) > 200:
+                        del output_lines[:100]
                 if log_fn:
+                    # Ignore high-frequency 20Hz telemetry prints to keep stdout drain instant
+                    if any(k in line for k in ("Target Left", "Target Right", "Actual left", "Actual right", "===", "Odom")):
+                        continue
                     sev = (
                         "error"
                         if any(

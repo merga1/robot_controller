@@ -15,18 +15,18 @@ else
 fi
 
 # ROS optional — enables rclpy when available (robot pose / teleop).
-# delv and abpi are used interchangeably — try both homes.
+# Source both workspaces required by articubot_one (order matters: l2jd_ws first).
 for setup in \
-  "${HOME}/Real1/install/setup.bash" \
-  "/home/abpi/Real1/install/setup.bash" \
-  "/home/delv/Real1/install/setup.bash"
+  "/home/delv/l2jd_ws/install/setup.bash" \
+  "/home/delv/articubot_one1/install/setup.bash"
 do
   if [ -f "$setup" ]; then
     # shellcheck disable=SC1091
-    # Real1/ROS setup.bash references unset vars (e.g. COLCON_TRACE) — no "set -u".
+    # ROS setup.bash references unset vars (e.g. COLCON_TRACE) — no "set -u".
     # shellcheck source=/dev/null
     source "$setup"
-    break
+  else
+    echo "WARNING: ROS setup not found: $setup" >&2
   fi
 done
 

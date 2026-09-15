@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
 # Manual drive diagnostic — run on Pi after START + JOYSTICK
 set -eo pipefail
-if [ -f "${HOME}/Real1/install/setup.bash" ]; then
-  # shellcheck disable=SC1091
-  source "${HOME}/Real1/install/setup.bash"
-fi
+# Source both workspaces required by articubot_one.
+# shellcheck disable=SC1091
+for setup in \
+  "/home/delv/l2jd_ws/install/setup.bash" \
+  "/home/delv/articubot_one1/install/setup.bash"
+do
+  if [ -f "$setup" ]; then
+    # shellcheck source=/dev/null
+    source "$setup"
+  else
+    echo "WARNING: ROS setup not found: $setup" >&2
+  fi
+done
 
 echo "=== Drive diagnosis ==="
 echo
@@ -22,14 +31,13 @@ cat /tmp/robot_cmd_vel.state 2>/dev/null || echo "(no state file — tap JOYSTIC
 echo
 timeout 5 ros2 topic echo /cmd_vel --once 2>/dev/null || echo "(no messages in 5s)"
 echo
-echo "--- Pulse test (150 RPM linear.x for 2s) ---"
-echo "NOTE: teleop_twist_keyboard sends m/s (e.g. 0.5) — robotBridge uses RPM and int(0.5)=0."
-echo "Use RPM values like 150, not teleop_twist_keyboard, to test motors."
+echo "--- Pulse test (0.3 m/s linear.x for 2s) ---"
+echo "NOTE: articubot_one expects m/s on /cmd_vel (standard ROS2). Use values like 0.3, not 150 RPM."
 timeout 3 ros2 topic pub /cmd_vel geometry_msgs/msg/Twist \
-  "{linear: {x: 150.0}, angular: {z: 0.0}}" \
+  "{linear: {x: 0.3}, angular: {z: 0.0}}" \
   -r 10 --qos-reliability reliable --qos-durability volatile &
 sleep 3.5
-echo "If robot did not move during 150 RPM pulse, issue is robotBridge/motors — not tablet/QoS."
+echo "If robot did not move during 0.3 m/s pulse, issue is articubot_one/motors — not tablet/QoS."
 echo
 echo "--- Relay QoS (grep log) ---"
 grep -E 'RELIABLE|BEST_EFFORT|cmd_vel relay' /tmp/cmd_vel_relay.log 2>/dev/null | tail -5 || echo "(no relay log)"
