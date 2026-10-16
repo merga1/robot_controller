@@ -10,6 +10,7 @@ class PrefsService {
   static const _keyNotifyBattery = 'notify_battery';
   static const _keyNotifyMission = 'notify_mission';
   static const _keyNotifyLaunch = 'notify_launch';
+  static const _keyDarkMode = 'dark_mode';
 
   static const piUsername = 'delv';
 
@@ -105,5 +106,15 @@ class PrefsService {
   static Future<void> setNotifyLaunch(bool v) async {
     final p = await SharedPreferences.getInstance();
     await p.setBool(_keyNotifyLaunch, v);
+  }
+
+  static Future<bool> getDarkMode() async {
+    final p = await SharedPreferences.getInstance();
+    return p.getBool(_keyDarkMode) ?? false;
+  }
+
+  static Future<void> setDarkMode(bool v) async {
+    final p = await SharedPreferences.getInstance();
+    await p.setBool(_keyDarkMode, v);
   }
 }

@@ -1,9 +1,17 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import '../theme/app_theme.dart';
 
 /// Virtual joystick — maps drag to linear speed + rotation (cmd_vel).
+///
+/// Performance notes (2026-09):
+///  • No rate-limiter inside the widget — the parent's 60 ms _cmdVelTimer
+///    is the sole HTTP send loop. The widget emits onMove on every gesture
+///    update so the parent always has the latest position.
+///  • Paint threshold lowered to 0.5 px and repaint interval to 16 ms (≈60 fps)
+///    so the knob tracks the finger without visual lag.
 class JoystickWidget extends StatefulWidget {
   final bool enabled;
   final void Function(double linear, double angular) onMove;
@@ -24,37 +32,14 @@ class _JoystickWidgetState extends State<JoystickWidget> {
   Offset _knob = Offset.zero;
   static const _maxLinear = 0.5;
   static const _maxAngular = 1.0;
-  static const _paintInterval = Duration(milliseconds: 33);
-  static const _moveInterval = Duration(milliseconds: 80);
+  // 60 fps repaint — knob tracks finger without visual lag.
+  static const _paintInterval = Duration(milliseconds: 16);
 
   DateTime? _lastPaintAt;
-  DateTime? _lastMoveAt;
-  Timer? _moveTimer;
-  double _pendingLinear = 0;
-  double _pendingAngular = 0;
 
   @override
   void dispose() {
-    _moveTimer?.cancel();
     super.dispose();
-  }
-
-  void _emitMove(double linear, double angular) {
-    _pendingLinear = linear;
-    _pendingAngular = angular;
-    final now = DateTime.now();
-    if (_lastMoveAt != null && now.difference(_lastMoveAt!) < _moveInterval) {
-      _moveTimer ??= Timer(_moveInterval, _flushMove);
-      return;
-    }
-    _flushMove();
-  }
-
-  void _flushMove() {
-    _moveTimer?.cancel();
-    _moveTimer = null;
-    _lastMoveAt = DateTime.now();
-    widget.onMove(_pendingLinear, _pendingAngular);
   }
 
   void _update(Offset local, Size size) {
@@ -68,9 +53,11 @@ class _JoystickWidgetState extends State<JoystickWidget> {
     }
 
     final now = DateTime.now();
-    final knobMoved = (delta - _knob).distance > 1.5;
+    // Lower threshold (0.5 px) so tiny corrections are detected.
+    final knobMoved = (delta - _knob).distance > 0.5;
     final shouldPaint = knobMoved &&
-        (_lastPaintAt == null || now.difference(_lastPaintAt!) >= _paintInterval);
+        (_lastPaintAt == null ||
+            now.difference(_lastPaintAt!) >= _paintInterval);
     if (shouldPaint) {
       _lastPaintAt = now;
       setState(() => _knob = delta);
@@ -80,15 +67,13 @@ class _JoystickWidgetState extends State<JoystickWidget> {
 
     final linear = (-delta.dy / radius) * _maxLinear;
     final angular = (-delta.dx / radius) * _maxAngular;
-    _emitMove(linear, angular);
+
+    // Emit the new position — the parent's _cmdVelTimer is the sole send loop.
+    widget.onMove(linear, angular);
   }
 
   void _reset() {
-    _moveTimer?.cancel();
-    _moveTimer = null;
-    _lastMoveAt = null;
-    _pendingLinear = 0;
-    _pendingAngular = 0;
+    _lastPaintAt = null;
     if (_knob != Offset.zero) {
       setState(() => _knob = Offset.zero);
     }
@@ -97,6 +82,7 @@ class _JoystickWidgetState extends State<JoystickWidget> {
 
   @override
   Widget build(BuildContext context) {
+    // RepaintBoundary prevents joystick repaints from propagating up the tree.
     return RepaintBoundary(
       child: Column(
         children: [
@@ -112,7 +98,10 @@ class _JoystickWidgetState extends State<JoystickWidget> {
                   onPanCancel: _reset,
                   child: CustomPaint(
                     size: size,
-                    painter: _JoystickPainter(knob: _knob, enabled: widget.enabled),
+                    painter: _JoystickPainter(
+                      knob: _knob,
+                      enabled: widget.enabled,
+                    ),
                   ),
                 );
               },
@@ -126,35 +115,35 @@ class _JoystickWidgetState extends State<JoystickWidget> {
                 icon: Icons.arrow_upward,
                 label: 'Forward',
                 enabled: widget.enabled,
-                onPressed: () => _emitMove(_maxLinear, 0),
-                onReleased: _reset,
+                onPressed: () => widget.onMove(_maxLinear, 0),
+                onReleased: widget.onRelease,
               ),
               _QuickBtn(
                 icon: Icons.arrow_downward,
                 label: 'Back',
                 enabled: widget.enabled,
-                onPressed: () => _emitMove(-_maxLinear, 0),
-                onReleased: _reset,
+                onPressed: () => widget.onMove(-_maxLinear, 0),
+                onReleased: widget.onRelease,
               ),
               _QuickBtn(
                 icon: Icons.rotate_left,
                 label: 'Left',
                 enabled: widget.enabled,
-                onPressed: () => _emitMove(0, _maxAngular),
-                onReleased: _reset,
+                onPressed: () => widget.onMove(0, _maxAngular),
+                onReleased: widget.onRelease,
               ),
               _QuickBtn(
                 icon: Icons.rotate_right,
                 label: 'Right',
                 enabled: widget.enabled,
-                onPressed: () => _emitMove(0, -_maxAngular),
-                onReleased: _reset,
+                onPressed: () => widget.onMove(0, -_maxAngular),
+                onReleased: widget.onRelease,
               ),
               _QuickBtn(
                 icon: Icons.stop_circle,
                 label: 'Stop',
                 enabled: widget.enabled,
-                onPressed: _reset,
+                onPressed: widget.onRelease,
                 onReleased: () {},
                 color: AppColors.red,
               ),
@@ -203,15 +192,31 @@ class _QuickBtnState extends State<_QuickBtn> {
     widget.onPressed();
     // Keep re-emitting while held so drive stays continuous.
     _holdTimer?.cancel();
-    _holdTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
+    _holdTimer = Timer.periodic(const Duration(milliseconds: 60), (_) {
       if (widget.enabled) widget.onPressed();
     });
   }
 
   void _up() {
+    // Always cancel — even if disabled — so a mid-hold state change
+    // (e.g. robot disconnects) never leaves the timer running.
     _holdTimer?.cancel();
     _holdTimer = null;
     if (widget.enabled) widget.onReleased();
+  }
+
+  /// If the widget becomes disabled while a button is being held
+  /// (e.g. robot disconnects, mode switch), stop the repeat timer
+  /// immediately so the last direction command is not looped forever.
+  @override
+  void didUpdateWidget(covariant _QuickBtn oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!widget.enabled && oldWidget.enabled) {
+      _holdTimer?.cancel();
+      _holdTimer = null;
+      // Do NOT call onReleased() here — the parent will send a stop
+      // command as part of its own disabling flow.
+    }
   }
 
   @override
@@ -259,22 +264,42 @@ class _JoystickPainter extends CustomPainter {
     final center = Offset(size.width / 2, size.height / 2);
     final radius = size.width / 2 - 8;
 
+    // Outer base circle.
     canvas.drawCircle(
       center,
       radius,
       Paint()
-        ..color = enabled ? AppColors.navy.withValues(alpha: 0.08) : Colors.grey.shade200
+        ..color = enabled
+            ? AppColors.navy.withValues(alpha: 0.08)
+            : Colors.grey.shade200
         ..style = PaintingStyle.fill,
     );
     canvas.drawCircle(
       center,
       radius,
       Paint()
-        ..color = enabled ? AppColors.navy.withValues(alpha: 0.3) : Colors.grey.shade400
+        ..color = enabled
+            ? AppColors.navy.withValues(alpha: 0.3)
+            : Colors.grey.shade400
         ..style = PaintingStyle.stroke
         ..strokeWidth = 2,
     );
 
+    // Direction indicator ring — glows when knob is displaced.
+    final displacement = knob.distance;
+    final maxRadius = size.width / 2 - 24;
+    if (displacement > 2 && enabled) {
+      final t = math.min(displacement / maxRadius, 1.0);
+      canvas.drawCircle(
+        center + knob,
+        30,
+        Paint()
+          ..color = AppColors.orange.withValues(alpha: 0.25 * t)
+          ..style = PaintingStyle.fill,
+      );
+    }
+
+    // Knob.
     final knobCenter = center + knob;
     canvas.drawCircle(
       knobCenter,
@@ -282,11 +307,18 @@ class _JoystickPainter extends CustomPainter {
       Paint()..color = enabled ? AppColors.navy : Colors.grey,
     );
 
+    // Cross-hair guide lines.
     final cross = Paint()
       ..color = AppColors.textSecondary.withValues(alpha: 0.3)
       ..strokeWidth = 1;
-    canvas.drawLine(Offset(center.dx, center.dy - radius), Offset(center.dx, center.dy + radius), cross);
-    canvas.drawLine(Offset(center.dx - radius, center.dy), Offset(center.dx + radius, center.dy), cross);
+    canvas.drawLine(
+        Offset(center.dx, center.dy - radius),
+        Offset(center.dx, center.dy + radius),
+        cross);
+    canvas.drawLine(
+        Offset(center.dx - radius, center.dy),
+        Offset(center.dx + radius, center.dy),
+        cross);
   }
 
   @override

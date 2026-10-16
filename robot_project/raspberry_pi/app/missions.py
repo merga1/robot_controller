@@ -1,175 +1,121 @@
-"""Mission management — FR-MISS-1 through FR-MISS-5."""
+"""
+missions.py — Multi-stop mission management.
+
+A mission is an ordered list of destination names. The server sends each
+NavigateToPose goal sequentially, waiting for completion before moving to
+the next waypoint.
+
+Endpoints
+---------
+POST /missions   { destinations: [str, ...] }  → { id, status, destinations }
+GET  /missions/{id}                             → mission record
+"""
+
+import asyncio
 import threading
-import subprocess
-import os
-import sys
-from datetime import datetime, timezone
-from .database import get_db
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
+
+from .auth import require_auth
+from . import database, robot_link, ros_hub
+
+router = APIRouter(prefix="/missions", tags=["missions"])
+
+# ── Running mission state ─────────────────────────────────────────────────────
+
+_lock = threading.Lock()
+_running_mission: int | None = None   # current mission id
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+class MissionRequest(BaseModel):
+    destinations: list[str]
 
 
-def log_event(severity: str, source: str, message: str) -> None:
-    """Persist a structured log entry (FR-LOG-1)."""
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO events_log (timestamp, severity, source, message) VALUES (?, ?, ?, ?)",
-        (_now(), severity, source, message),
-    )
-    conn.commit()
-    conn.close()
+@router.post("")
+async def create_mission(body: MissionRequest, _auth=Depends(require_auth)):
+    if not body.destinations:
+        raise HTTPException(status_code=400, detail="destinations list is empty")
 
+    # Resolve all names to poses before starting
+    poses: list[dict] = []
+    for name in body.destinations:
+        dest = database.get_destination(name)
+        if dest is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Destination '{name}' not found",
+            )
+        poses.append(dest)
 
-def create_mission(username: str, destinations: list[str]) -> dict:
-    """FR-MISS-1: Create a delivery mission with an ordered list of destinations."""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO missions (created_by, status, created_at) VALUES (?, 'pending', ?)",
-        (username, _now()),
-    )
-    mission_id = cur.lastrowid
-    for order, dest in enumerate(destinations):
-        cur.execute(
-            "INSERT INTO mission_steps (mission_id, destination_label, step_order, status) "
-            "VALUES (?, ?, ?, 'pending')",
-            (mission_id, dest, order),
-        )
-    conn.commit()
-    conn.close()
-    log_event("info", "missions", f"Mission {mission_id} created by {username}: {destinations}")
-    return get_mission(mission_id)
+    mission_id = database.create_mission(body.destinations)
+    database.update_mission_status(mission_id, "running")
 
+    with _lock:
+        global _running_mission
+        _running_mission = mission_id
 
-def get_mission(mission_id: int) -> dict:
-    conn = get_db()
-    mission = conn.execute(
-        "SELECT * FROM missions WHERE id = ?", (mission_id,)
-    ).fetchone()
-    steps = conn.execute(
-        "SELECT * FROM mission_steps WHERE mission_id = ? ORDER BY step_order",
-        (mission_id,),
-    ).fetchall()
-    conn.close()
-    if not mission:
-        return None
+    # Run mission in a background asyncio task so the HTTP response returns
+    # immediately and the Flutter app can poll GET /missions/{id} for progress.
+    asyncio.create_task(_run_mission(mission_id, poses))
+
     return {
-        "id": mission["id"],
-        "created_by": mission["created_by"],
-        "status": mission["status"],
-        "created_at": mission["created_at"],
-        "completed_at": mission["completed_at"],
-        "steps": [
-            {
-                "id": s["id"],
-                "destination": s["destination_label"],
-                "order": s["step_order"],
-                "status": s["status"],
-            }
-            for s in steps
-        ],
-        "progress": f"{sum(1 for s in steps if s['status'] == 'completed')} of {len(steps)}",
+        "id": mission_id,
+        "status": "running",
+        "destinations": body.destinations,
     }
 
 
-def run_mission(mission_id: int, destinations: dict, robot_state: dict) -> None:
-    """FR-MISS-2: Execute mission steps sequentially in a background thread."""
+@router.get("/{mission_id}")
+async def get_mission(mission_id: int, _auth=Depends(require_auth)):
+    record = database.get_mission(mission_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    return record
 
-    def _execute():
-        conn = get_db()
-        conn.execute(
-            "UPDATE missions SET status='in_progress' WHERE id=?", (mission_id,)
-        )
-        conn.commit()
-        conn.close()
-        robot_state["current_mission"] = mission_id
 
-        steps = get_mission(mission_id)["steps"]
-        for step in steps:
-            if not robot_state.get("ros_running"):
-                _fail_mission(mission_id, "ROS 2 stopped during mission")
+# ── Background mission runner ─────────────────────────────────────────────────
+
+async def _run_mission(mission_id: int, poses: list[dict]) -> None:
+    """
+    Drive through each waypoint sequentially.
+    Gives up if the robot is not operational or if navigation fails.
+    """
+    global _running_mission
+    for i, dest in enumerate(poses):
+        with _lock:
+            if _running_mission != mission_id:
+                # Mission was cancelled externally
+                database.update_mission_status(mission_id, "cancelled", completed=True)
                 return
 
-            dest_name = step["destination"]
-            dest = destinations.get(dest_name)
-            if not dest:
-                _fail_mission(mission_id, f"Unknown destination: {dest_name}")
+        name = dest["name"]
+        x, y, theta = dest["x"], dest["y"], dest["theta"]
+
+        # Send the goal
+        ros_hub.send_nav_goal(name, x, y, theta)
+
+        # Wait for navigation to finish (poll every 1 s, timeout 120 s)
+        timeout = 120
+        for _ in range(timeout):
+            await asyncio.sleep(1)
+            with _lock:
+                cancelled = _running_mission != mission_id
+            if cancelled:
+                ros_hub.cancel_nav_goal()
+                database.update_mission_status(mission_id, "cancelled", completed=True)
                 return
+            if not ros_hub.is_navigating():
+                break
+        else:
+            # Timed out on this waypoint
+            ros_hub.cancel_nav_goal()
+            database.update_mission_status(mission_id, "failed", completed=True)
+            return
 
-            # Mark step in_progress
-            conn = get_db()
-            conn.execute(
-                "UPDATE mission_steps SET status='in_progress' WHERE id=?", (step["id"],)
-            )
-            conn.commit()
-            conn.close()
-
-            robot_state["status"] = "navigating"
-            robot_state["current_goal"] = dest_name
-            robot_state["message"] = f"Mission {mission_id}: navigating to {dest_name}"
-            log_event("info", "missions", f"Mission {mission_id} step {step['order']}: -> {dest_name}")
-
-            # Call the Nav2 action client
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    os.path.join(
-                        os.path.dirname(__file__), "..", "ros2_nodes", "navigate_client.py"
-                    ),
-                    str(dest["x"]),
-                    str(dest["y"]),
-                    str(dest.get("theta", dest.get("yaw", 0))),
-                ],
-                timeout=120,
-            )
-
-            if result.returncode != 0:
-                # FR-MISS-5: halt mission and notify on failure
-                conn = get_db()
-                conn.execute(
-                    "UPDATE mission_steps SET status='failed' WHERE id=?", (step["id"],)
-                )
-                conn.commit()
-                conn.close()
-                _fail_mission(mission_id, f"Navigation to {dest_name} failed")
-                robot_state["status"] = "error"
-                robot_state["message"] = f"Mission {mission_id} failed at step: {dest_name}"
-                robot_state["current_mission"] = None
-                return
-
-            # Step succeeded
-            conn = get_db()
-            conn.execute(
-                "UPDATE mission_steps SET status='completed' WHERE id=?", (step["id"],)
-            )
-            conn.commit()
-            conn.close()
-
-        # All steps done
-        conn = get_db()
-        conn.execute(
-            "UPDATE missions SET status='completed', completed_at=? WHERE id=?",
-            (_now(), mission_id),
-        )
-        conn.commit()
-        conn.close()
-        robot_state["status"] = "running"
-        robot_state["current_goal"] = None
-        robot_state["current_mission"] = None
-        robot_state["message"] = f"Mission {mission_id} completed"
-        log_event("info", "missions", f"Mission {mission_id} completed successfully")
-
-    threading.Thread(target=_execute, daemon=True).start()
-
-
-def _fail_mission(mission_id: int, reason: str) -> None:
-    conn = get_db()
-    conn.execute(
-        "UPDATE missions SET status='failed', completed_at=? WHERE id=?",
-        (_now(), mission_id),
-    )
-    conn.commit()
-    conn.close()
-    log_event("error", "missions", f"Mission {mission_id} failed: {reason}")
+    # All waypoints done
+    with _lock:
+        if _running_mission == mission_id:
+            _running_mission = None
+    database.update_mission_status(mission_id, "completed", completed=True)

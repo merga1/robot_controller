@@ -1,90 +1,112 @@
-"""JWT authentication — FR-AUTH-1 / FR-AUTH-2 / FR-AUTH-3."""
-import hashlib
-import time
-import json
-import base64
-import hmac
+"""
+auth.py — JWT authentication for the robot API.
+
+Endpoints:
+  POST /auth/login   { username, password } → { access_token, role }
+
+Users are configured via environment variables:
+  ROBOT_ADMIN_USER / ROBOT_ADMIN_PASS   (default: admin / admin)
+  ROBOT_USER_USER  / ROBOT_USER_PASS   (default: user  / user)
+
+TOKEN_TTL: tokens expire after 1 hour (matches the Flutter client expectation).
+"""
+
 import os
-from fastapi import HTTPException, Security
+import time
+from datetime import datetime, timedelta, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from .database import get_db
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from pydantic import BaseModel
 
-SECRET = os.environ.get("ROBOT_JWT_SECRET", "change-me-in-production")
-TOKEN_TTL = 3600  # 1 hour
+# ── Config ────────────────────────────────────────────────────────────────────
 
-bearerscheme = HTTPBearer()
+SECRET_KEY = os.getenv("ROBOT_JWT_SECRET", "change-me-in-production-robot-secret-2024")
+ALGORITHM = "HS256"
+TOKEN_TTL = timedelta(hours=1)
 
+_pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-def _b64(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+# In-memory user store — extend with a DB if you need more users.
+_USERS: dict[str, dict] = {
+    os.getenv("ROBOT_ADMIN_USER", "admin"): {
+        "hashed": _pwd_ctx.hash(os.getenv("ROBOT_ADMIN_PASS", "admin")),
+        "role": "admin",
+    },
+    os.getenv("ROBOT_USER_USER", "user"): {
+        "hashed": _pwd_ctx.hash(os.getenv("ROBOT_USER_PASS", "user")),
+        "role": "user",
+    },
+}
 
+# ── Router ────────────────────────────────────────────────────────────────────
 
-def _sign(payload: dict) -> str:
-    header = _b64(b'{"alg":"HS256","typ":"JWT"}')
-    body = _b64(json.dumps(payload, separators=(",", ":")).encode())
-    sig = hmac.new(SECRET.encode(), f"{header}.{body}".encode(), hashlib.sha256).digest()
-    return f"{header}.{body}.{_b64(sig)}"
-
-
-def _decode_token(token: str) -> dict:
-    if not token or not token.strip():
-        raise ValueError("missing token")
-    token = token.strip()
-    header, body, sig = token.split(".")
-    expected = _b64(
-        hmac.new(SECRET.encode(), f"{header}.{body}".encode(), hashlib.sha256).digest()
-    )
-    if not hmac.compare_digest(sig, expected):
-        raise ValueError("bad signature")
-    payload = json.loads(base64.urlsafe_b64decode(body + "=="))
-    if payload["exp"] < time.time():
-        raise ValueError("expired")
-    return payload
+router = APIRouter(prefix="/auth", tags=["auth"])
+_bearer = HTTPBearer(auto_error=False)
 
 
-def _verify(token: str) -> dict:
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    role: str
+
+
+def _create_token(username: str, role: str) -> str:
+    expire = datetime.now(timezone.utc) + TOKEN_TTL
+    payload = {"sub": username, "role": role, "exp": expire}
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def _verify_token(token: str) -> dict:
+    """Decode and validate a JWT. Raises HTTPException 401 on failure."""
     try:
-        return _decode_token(token)
-    except Exception as exc:
-        raise HTTPException(status_code=401, detail=str(exc))
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+        )
 
 
-def verify_token(token: str) -> dict:
-    """Verify JWT for WebSocket (raises ValueError, not HTTPException)."""
-    return _decode_token(token)
+@router.post("/login", response_model=TokenResponse)
+async def login(req: LoginRequest):
+    user = _USERS.get(req.username)
+    if not user or not _pwd_ctx.verify(req.password, user["hashed"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+        )
+    token = _create_token(req.username, user["role"])
+    return TokenResponse(access_token=token, role=user["role"])
 
 
-def create_token(username: str, role: str) -> str:
-    return _sign({"sub": username, "role": role, "exp": time.time() + TOKEN_TTL})
+# ── Dependency ────────────────────────────────────────────────────────────────
 
-
-def verify_password(plain: str, hashed: str) -> bool:
-    return hashlib.sha256(plain.encode()).hexdigest() == hashed
-
-
-def login(username: str, password: str) -> dict:
-    conn = get_db()
-    row = conn.execute(
-        "SELECT username, password_hash, role FROM users WHERE username = ?",
-        (username,),
-    ).fetchone()
-    conn.close()
-    if not row or not verify_password(password, row["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = create_token(row["username"], row["role"])
-    return {"access_token": token, "token_type": "bearer", "role": row["role"]}
-
-
-def require_user(
-    creds: HTTPAuthorizationCredentials = Security(bearerscheme),
+def require_auth(
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> dict:
-    return _verify(creds.credentials)
+    """FastAPI dependency — injects the decoded JWT payload or raises 401."""
+    if not creds:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authorization header missing",
+        )
+    return _verify_token(creds.credentials)
 
 
-def require_admin(
-    creds: HTTPAuthorizationCredentials = Security(bearerscheme),
-) -> dict:
-    payload = _verify(creds.credentials)
-    if payload.get("role") != "administrator":
-        raise HTTPException(status_code=403, detail="Administrator role required")
+def require_admin(payload: dict = Depends(require_auth)) -> dict:
+    """Like require_auth but also enforces admin role."""
+    if payload.get("role") != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin role required",
+        )
     return payload

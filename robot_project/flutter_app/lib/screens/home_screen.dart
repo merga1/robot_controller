@@ -13,6 +13,7 @@ import '../widgets/joystick_widget.dart';
 import 'login_screen.dart';
 import 'missions_screen.dart';
 import 'logs_screen.dart';
+import 'navigation_screen.dart';
 import 'settings_screen.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -28,20 +29,20 @@ enum _ControlMode { navigation, joystick }
 class _HomeScreenState extends State<HomeScreen> {
   RobotState _state = RobotState.initial();
   List<String> _destinations = [];
-  String? _selectedDest;
   bool _loadingStart = false;
-  bool _loadingNav = false;
   bool _loadingMotors = false;
   bool _loadingTestDrive = false;
   bool _loadingReady = false;
   String? _actionError;
   _ControlMode _controlMode = _ControlMode.navigation;
   bool _joystickActive = false;
-  bool _joystickDebugShown = false;
   Timer? _cmdVelTimer;
   Timer? _uiThrottleTimer;
+  // Atomic snapshot — written on the UI thread, read by the timer callback.
   double _lastLinear = 0;
   double _lastAngular = 0;
+  // How often the periodic timer sends cmd_vel while the joystick is held.
+  static const _kCmdVelPeriod = Duration(milliseconds: 60);
 
   final _notifications = NotificationService();
   List<AppNotification> _notificationItems = [];
@@ -70,18 +71,25 @@ class _HomeScreenState extends State<HomeScreen> {
       final prev = _state;
       _state = s;
       _notifications.onStateUpdate(s);
-      if (_joystickActive) {
-        final critical = prev.status != s.status ||
-            prev.rosRunning != s.rosRunning ||
-            prev.connection != s.connection ||
-            prev.bridgeVerified != s.bridgeVerified;
-        if (critical) {
-          setState(() {});
-        } else {
-          _scheduleUiRefresh();
-        }
-      } else {
-        setState(() {});
+      // Only rebuild when something the UI actually renders has changed.
+      final visiblyChanged =
+          prev.status != s.status ||
+          prev.rosRunning != s.rosRunning ||
+          prev.connection != s.connection ||
+          prev.bridgeVerified != s.bridgeVerified ||
+          prev.isNavigating != s.isNavigating ||
+          prev.destination != s.destination ||
+          prev.message != s.message ||
+          prev.battery != s.battery ||
+          prev.batteryAlert != s.batteryAlert ||
+          prev.nodeHealth.length != s.nodeHealth.length ||
+          prev.canOperate != s.canOperate;
+      if (visiblyChanged) {
+        if (mounted) setState(() {});
+      } else if (!_joystickActive) {
+        // Pose-only updates: defer a 500ms repaint so the pose display
+        // stays fresh without hammering the build cycle.
+        _scheduleUiRefresh();
       }
     });
     _notifSub = _notifications.stream.listen((items) {
@@ -312,12 +320,19 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _selectNavigationMode() async {
     if (_controlMode == _ControlMode.navigation) return;
+    // Zero velocities FIRST so any in-flight timer tick reads 0.
+    _lastLinear = 0;
+    _lastAngular = 0;
+    _cmdVelTimer?.cancel();
+    _cmdVelTimer = null;
+    _uiThrottleTimer?.cancel();
     setState(() {
       _controlMode = _ControlMode.navigation;
       _joystickActive = false;
     });
-    _cmdVelTimer?.cancel();
-    _uiThrottleTimer?.cancel();
+    // Explicitly send a stop command before disabling teleop so the
+    // robot doesn't keep moving after the mode switch.
+    try { await widget.service.sendCmdVel(0, 0); } catch (_) {}
     try {
       await widget.service.enableTeleop(false);
     } catch (_) {}
@@ -336,7 +351,6 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       _controlMode = _ControlMode.joystick;
       _actionError = null;
-      _joystickDebugShown = false;
     });
     try {
       await widget.service.cancelNavigation();
@@ -360,39 +374,50 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _onJoystickMove(double linear, double angular) {
+    // Atomically update so the timer callback always reads the latest values.
     _lastLinear = linear;
     _lastAngular = angular;
-    _cmdVelTimer ??= Timer.periodic(const Duration(milliseconds: 100), (_) {
-      _sendCmdVelTick();
-    });
-    _sendCmdVelTick();
+    // Do NOT send immediately — only the periodic _cmdVelTimer sends HTTP
+    // requests, preventing a flood of requests on every finger-move event.
+    _cmdVelTimer ??= Timer.periodic(_kCmdVelPeriod, (_) => _sendCmdVelTick());
   }
 
   void _sendCmdVelTick() {
-    widget.service.sendCmdVel(_lastLinear, _lastAngular).catchError((_) {});
+    // Capture to locals so the async send uses the values at the moment of
+    // invocation, not whatever _lastLinear/_lastAngular become later.
+    final linear = _lastLinear;
+    final angular = _lastAngular;
+    // Fire-and-forget — errors are silently swallowed so a Wi-Fi hiccup on a
+    // single cmd_vel tick never surfaces as a UI error.
+    () async {
+      try { await widget.service.sendCmdVel(linear, angular); } catch (_) {}
+    }();
   }
 
   Future<void> _onJoystickRelease() async {
-    _cmdVelTimer?.cancel();
-    _cmdVelTimer = null;
+    // Cancel the periodic timer FIRST and zero the snapshot values so
+    // that any tick already in-flight reads (0, 0) if it fires before
+    // the timer is fully cancelled.
     _lastLinear = 0;
     _lastAngular = 0;
-    try {
-      await widget.service.sendCmdVel(0, 0);
-    } catch (_) {}
-  }
+    _cmdVelTimer?.cancel();
+    _cmdVelTimer = null;
 
-  Future<void> _navigate(String dest) async {
-    if (_controlMode != _ControlMode.navigation) await _selectNavigationMode();
-    setState(() { _loadingNav = true; _actionError = null; });
-    try {
-      await widget.service.sendGoal(dest);
-    } catch (e) {
-      setState(() => _actionError = e.toString().replaceFirst('Exception: ', ''));
-    } finally {
-      setState(() => _loadingNav = false);
+    // Retry stop up to 3 times with 50 ms gaps so a single dropped HTTP
+    // request on Wi-Fi does not leave the robot moving for 800 ms.
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        await widget.service.sendCmdVel(0, 0);
+        break; // success — no need to retry
+      } catch (_) {
+        if (attempt < 2) {
+          await Future.delayed(const Duration(milliseconds: 50));
+        }
+      }
     }
   }
+
+
 
   Future<void> _enableMotors() async {
     setState(() => _loadingMotors = true);
@@ -528,36 +553,75 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ],
         ),
-        body: SingleChildScrollView(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            children: [
-              NotificationPanel(
-                notifications: _notificationItems,
-                onAck: _notifications.ack,
-              ),
-              StatusCard(state: _state),
-              if (_actionError != null) ...[
-                const SizedBox(height: 10),
-                _ErrorBanner(
-                  message: _actionError!,
-                  onDismiss: () => setState(() => _actionError = null),
+        // Split the body: scrollable status/controls at top, fixed joystick at
+        // bottom. This prevents the ScrollView from stealing pan gestures from
+        // the joystick when the user drags vertically.
+        body: _controlMode == _ControlMode.joystick
+            ? Column(
+                children: [
+                  Expanded(
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.fromLTRB(20, 20, 20, 0),
+                      child: Column(
+                        children: [
+                          NotificationPanel(
+                            notifications: _notificationItems,
+                            onAck: _notifications.ack,
+                          ),
+                          StatusCard(state: _state),
+                          if (_actionError != null) ...[
+                            const SizedBox(height: 10),
+                            _ErrorBanner(
+                              message: _actionError!,
+                              onDismiss: () => setState(() => _actionError = null),
+                            ),
+                          ],
+                          const SizedBox(height: 20),
+                          _buildNodeHealth(),
+                          const SizedBox(height: 20),
+                          _buildControls(),
+                          const SizedBox(height: 20),
+                          _buildModeSelector(),
+                          const SizedBox(height: 8),
+                        ],
+                      ),
+                    ),
+                  ),
+                  // Joystick lives OUTSIDE the ScrollView so pan gestures are
+                  // never competed over by the scroll physics.
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+                    child: _buildJoystick(),
+                  ),
+                ],
+              )
+            : SingleChildScrollView(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  children: [
+                    NotificationPanel(
+                      notifications: _notificationItems,
+                      onAck: _notifications.ack,
+                    ),
+                    StatusCard(state: _state),
+                    if (_actionError != null) ...[
+                      const SizedBox(height: 10),
+                      _ErrorBanner(
+                        message: _actionError!,
+                        onDismiss: () => setState(() => _actionError = null),
+                      ),
+                    ],
+                    const SizedBox(height: 20),
+                    _buildNodeHealth(),
+                    const SizedBox(height: 20),
+                    _buildControls(),
+                    const SizedBox(height: 20),
+                    _buildModeSelector(),
+                    const SizedBox(height: 16),
+                    _buildNavigation(),
+                  ],
                 ),
-              ],
-              const SizedBox(height: 20),
-              _buildNodeHealth(),
-              const SizedBox(height: 20),
-              _buildControls(),
-              const SizedBox(height: 20),
-              _buildModeSelector(),
-              const SizedBox(height: 16),
-              if (_controlMode == _ControlMode.navigation)
-                _buildNavigation()
-              else
-                _buildJoystick(),
-            ],
-          ),
-        ),
+              ),
         floatingActionButton: FloatingActionButton.extended(
           backgroundColor: AppColors.navy,
           foregroundColor: Colors.white,
@@ -808,43 +872,112 @@ class _HomeScreenState extends State<HomeScreen> {
                   TextButton.icon(
                     onPressed: () => widget.service.cancelNavigation(),
                     icon: const Icon(Icons.cancel, size: 16, color: AppColors.orange),
-                    label: const Text('Cancel', style: TextStyle(color: AppColors.orange)),
+                    label: const Text('Cancel',
+                        style: TextStyle(color: AppColors.orange)),
                   ),
               ],
             ),
-            const SizedBox(height: 14),
-            if (_destinations.isEmpty)
-              const Text('No destinations loaded.',
-                  style: TextStyle(color: AppColors.textSecondary))
-            else
-              Wrap(
-                spacing: 10,
-                runSpacing: 10,
-                children: _destinations.map((dest) {
-                  final selected = _selectedDest == dest;
-                  return ChoiceChip(
-                    label: Text(dest),
-                    selected: selected,
-                    selectedColor: AppColors.navy,
-                    labelStyle: TextStyle(
-                      color: selected ? Colors.white : AppColors.textPrimary,
-                      fontWeight: FontWeight.w500,
+            // Show current navigation status when in progress
+            if (_state.isNavigating) ...[
+              const SizedBox(height: 10),
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                decoration: BoxDecoration(
+                  color: AppColors.navy.withValues(alpha: 0.08),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  children: [
+                    const SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(
+                          strokeWidth: 2, color: AppColors.navy),
                     ),
-                    onSelected: _state.canOperate
-                        ? (_) => setState(() => _selectedDest = dest)
-                        : null,
-                  );
-                }).toList(),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        _state.destination != null
+                            ? 'Navigating → ${_state.destination}'
+                            : _state.message,
+                        style: const TextStyle(
+                            color: AppColors.navy,
+                            fontWeight: FontWeight.w600,
+                            fontSize: 13),
+                      ),
+                    ),
+                  ],
+                ),
               ),
+            ],
             const SizedBox(height: 16),
-            ActionButton(
-              label: 'NAVIGATE',
-              icon: Icons.navigation,
-              color: AppColors.navy,
-              loading: _loadingNav,
-              onPressed: (_state.canOperate && _selectedDest != null && !_state.isNavigating)
-                  ? () => _navigate(_selectedDest!)
-                  : null,
+            // Open the real map navigation screen.
+            // Wrap in Tooltip + GestureDetector so disabled taps still give
+            // the user feedback explaining what they need to do first.
+            Tooltip(
+              message: _state.canOperate
+                  ? ''
+                  : _state.isLaunching
+                      ? 'Robot is starting — please wait…'
+                      : 'Press START first to launch the robot',
+              child: GestureDetector(
+                onTap: !_state.canOperate
+                    ? () {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: Text(
+                              _state.isLaunching
+                                  ? 'Robot is starting — please wait…'
+                                  : 'Press START first to launch the robot.',
+                            ),
+                            duration: const Duration(seconds: 3),
+                          ),
+                        );
+                      }
+                    : null,
+                child: SizedBox(
+                  width: double.infinity,
+                  height: 52,
+                  child: ElevatedButton.icon(
+                    onPressed: _state.canOperate
+                        ? () {
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) =>
+                                    NavigationScreen(service: widget.service),
+                              ),
+                            ).then((_) {
+                              _loadDestinations();
+                            });
+                          }
+                        : null,
+                    icon: const Icon(Icons.map),
+                    label: const Text('Open Navigation Map'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: AppColors.navy,
+                      foregroundColor: Colors.white,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              _state.canOperate
+                  ? 'Select a destination on the real map and press GO to navigate.'
+                  : _state.isLaunching
+                      ? 'Waiting for robot to finish starting…'
+                      : 'Robot not running — press START above to begin.',
+              style: TextStyle(
+                fontSize: 11,
+                color: _state.canOperate
+                    ? AppColors.textSecondary
+                    : _state.isLaunching
+                        ? AppColors.orange
+                        : AppColors.red,
+              ),
             ),
           ],
         ),

@@ -1,7 +1,10 @@
 import 'package:flutter/material.dart';
+import '../main.dart';
+import '../models/map_models.dart';
 import '../services/prefs_service.dart';
 import '../services/robot_service.dart';
 import '../theme/app_theme.dart';
+import 'navigation_screen.dart';
 
 /// Settings — FR-SET-1 / FR-SET-2 / FR-SET-3
 class SettingsScreen extends StatefulWidget {
@@ -16,7 +19,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   int _idleTimeout = 30;
   bool _notifyMission = true;
   bool _notifyLaunch = true;
-  List<String> _destinations = [];
+  bool _darkMode = false;
+  List<DestinationPose> _destinations = [];
   bool _loading = true;
   String? _error;
   String? _success;
@@ -40,7 +44,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _idleTimeout = await PrefsService.getIdleTimeoutMinutes();
       _notifyMission = await PrefsService.getNotifyMission();
       _notifyLaunch = await PrefsService.getNotifyLaunch();
-      _destinations = await widget.service.getDestinations();
+      _darkMode = await PrefsService.getDarkMode();
+      _destinations = await widget.service.getDestinationPoses();
     } catch (e) {
       _error = e.toString();
     } finally {
@@ -63,12 +68,61 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _xCtrl.clear();
       _yCtrl.clear();
       _thetaCtrl.text = '0';
-      _destinations = await widget.service.getDestinations();
-      setState(() => _success = "Destination '$name' added.");
+      _destinations = await widget.service.getDestinationPoses();
+      if (mounted) setState(() => _success = "Destination '$name' added.");
     } catch (e) {
       setState(() => _error = e.toString().replaceFirst('Exception: ', ''));
     }
   }
+
+  /// Open the real map to let the admin pick a pose by tapping + dragging.
+  Future<void> _addFromMap() async {
+    final name = _nameCtrl.text.trim();
+    if (name.isEmpty) {
+      setState(() => _error = 'Enter a destination name first.');
+      return;
+    }
+    setState(() { _error = null; _success = null; });
+    final pose = await showMapPosePicker(
+      context: context,
+      service: widget.service,
+      destinationName: name,
+      existingDestinations: _destinations,
+    );
+    if (pose == null || !mounted) return;
+    // Pre-fill the manual form fields with the picked values
+    _xCtrl.text = pose.x.toStringAsFixed(3);
+    _yCtrl.text = pose.y.toStringAsFixed(3);
+    _thetaCtrl.text = pose.theta.toStringAsFixed(1);
+    // Auto-save immediately
+    await _addDestination();
+  }
+
+  /// Open the real map to reposition an existing destination.
+  Future<void> _editOnMap(DestinationPose d) async {
+    setState(() { _error = null; _success = null; });
+    final updated = await showMapPosePicker(
+      context: context,
+      service: widget.service,
+      destinationName: d.name,
+      initialPose: d,
+      existingDestinations: _destinations,
+    );
+    if (updated == null || !mounted) return;
+    try {
+      await widget.service.addDestination(
+        updated.name,
+        updated.x,
+        updated.y,
+        updated.theta,
+      );
+      _destinations = await widget.service.getDestinationPoses();
+      if (mounted) setState(() => _success = "Updated '${d.name}' position.");
+    } catch (e) {
+      setState(() => _error = e.toString().replaceFirst('Exception: ', ''));
+    }
+  }
+
 
   Future<void> _deleteDestination(String name) async {
     final ok = await showDialog<bool>(
@@ -88,7 +142,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (ok != true) return;
     try {
       await widget.service.deleteDestination(name);
-      _destinations = await widget.service.getDestinations();
+      _destinations = await widget.service.getDestinationPoses();
       setState(() => _success = "Destination '$name' deleted.");
     } catch (e) {
       setState(() => _error = e.toString().replaceFirst('Exception: ', ''));
@@ -127,6 +181,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       'Change IP/port on the login screen by signing out.',
                       style: TextStyle(fontSize: 12, color: AppColors.textSecondary),
                     ),
+                  ),
+                ]),
+                const SizedBox(height: 16),
+                _section('Appearance', [
+                  SwitchListTile(
+                    secondary: const Icon(Icons.dark_mode_outlined),
+                    title: const Text('Dark mode'),
+                    subtitle: const Text('Switch between light and dark theme'),
+                    value: _darkMode,
+                    onChanged: (v) async {
+                      await PrefsService.setDarkMode(v);
+                      themeNotifier.value =
+                          v ? ThemeMode.dark : ThemeMode.light;
+                      setState(() => _darkMode = v);
+                    },
                   ),
                 ]),
                 const SizedBox(height: 16),
@@ -175,10 +244,28 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const SizedBox(height: 16),
                   _section('Destinations (Admin)', [
                     ..._destinations.map((d) => ListTile(
-                          title: Text(d),
-                          trailing: IconButton(
-                            icon: const Icon(Icons.delete_outline, color: AppColors.red),
-                            onPressed: () => _deleteDestination(d),
+                          title: Text(d.name),
+                          subtitle: Text(
+                            'x=${d.x.toStringAsFixed(2)}  '
+                            'y=${d.y.toStringAsFixed(2)}  '
+                            'θ=${d.theta.toStringAsFixed(1)}°',
+                            style: const TextStyle(
+                                fontSize: 12, color: AppColors.textSecondary),
+                          ),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton(
+                                icon: const Icon(Icons.edit_location_alt, color: AppColors.navy),
+                                tooltip: 'Reposition on map',
+                                onPressed: () => _editOnMap(d),
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.delete_outline, color: AppColors.red),
+                                tooltip: 'Delete',
+                                onPressed: () => _deleteDestination(d.name),
+                              ),
+                            ],
                           ),
                         )),
                     const Divider(),
@@ -217,13 +304,65 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             ),
                           ]),
                           const SizedBox(height: 12),
+                          // ── Add from Map (primary method) ────────────────
                           SizedBox(
                             width: double.infinity,
                             child: ElevatedButton.icon(
-                              onPressed: _addDestination,
-                              icon: const Icon(Icons.add_location_alt),
-                              label: const Text('Add Destination'),
+                              onPressed: _addFromMap,
+                              icon: const Icon(Icons.map),
+                              label: const Text('Pick on Map'),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: AppColors.navy,
+                                foregroundColor: Colors.white,
+                              ),
                             ),
+                          ),
+                          const SizedBox(height: 8),
+                          // ── Manual entry (fallback) ──────────────────────
+                          ExpansionTile(
+                            tilePadding: EdgeInsets.zero,
+                            title: const Text(
+                              'Manual coordinates',
+                              style: TextStyle(
+                                  fontSize: 13,
+                                  color: AppColors.textSecondary),
+                            ),
+                            children: [
+                              Row(children: [
+                                Expanded(
+                                  child: TextField(
+                                    controller: _xCtrl,
+                                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                                    decoration: const InputDecoration(labelText: 'X (m)'),
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: TextField(
+                                    controller: _yCtrl,
+                                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                                    decoration: const InputDecoration(labelText: 'Y (m)'),
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: TextField(
+                                    controller: _thetaCtrl,
+                                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                                    decoration: const InputDecoration(labelText: 'θ (°)'),
+                                  ),
+                                ),
+                              ]),
+                              const SizedBox(height: 8),
+                              SizedBox(
+                                width: double.infinity,
+                                child: OutlinedButton.icon(
+                                  onPressed: _addDestination,
+                                  icon: const Icon(Icons.add_location_alt),
+                                  label: const Text('Add Manually'),
+                                ),
+                              ),
+                            ],
                           ),
                         ],
                       ),

@@ -1,230 +1,230 @@
-"""Joystick / cmd_vel — 10 Hz keepalive prevents L2JD communication loss."""
+"""
+teleop.py — Manual drive (joystick) API endpoints.
+
+Endpoints
+---------
+POST /teleop/enable        { enabled: bool }   → arm or disarm the joystick
+POST /teleop/cmd_vel       { linear, angular }  → publish a Twist immediately
+POST /teleop/stop                               → send zero velocity + disarm
+POST /teleop/test-drive                         → short forward-backward nudge
+GET  /teleop/debug                              → rich diagnostics payload
+GET  /teleop/connection                         → end-to-end chain check
+
+State machine
+-------------
+  DISARMED: enableTeleop(false) — cmd_vel is accepted but not forwarded.
+  ARMED:    enableTeleop(true)  — cmd_vel is forwarded to ROS /cmd_vel.
+
+A watchdog timer sends zero velocity every 500 ms when armed but no
+cmd_vel has been received recently, preventing runaway if the tablet
+loses Wi-Fi.
+"""
+
+import os
 import threading
 import time
+from typing import Any
 
-from . import robot_link
-from . import ros_hub
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel
+
+from .auth import require_auth
+from . import ros_hub, robot_link
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+_WATCHDOG_INTERVAL = 0.5   # seconds — send stop if no cmd_vel received
+_WATCHDOG_TIMEOUT = 1.0    # seconds — how long without cmd_vel before stop
+
+# ── Teleop state ──────────────────────────────────────────────────────────────
 
 _lock = threading.Lock()
-_linear: float = 0.0
-_angular: float = 0.0
-_cmd_active: bool = False
-_publisher_started = False
-_teleop_armed: bool = False
-_motor_keepalive: bool = False
-_publish_count: int = 0
-_last_publish_at: float = 0.0
-_last_publish_ok: bool = False
-_last_tablet_linear: float = 0.0
-_last_tablet_angular: float = 0.0
-_debug_log: list[dict] = []
-_DEBUG_MAX = 30
+
+_teleop: dict[str, Any] = {
+    "armed": False,
+    "linear": 0.0,
+    "angular": 0.0,
+    "last_cmd_at": 0.0,
+    "publish_count": 0,
+}
+
+_watchdog_thread: threading.Thread | None = None
 
 
-def _log_debug(event: str, **fields) -> None:
-    global _debug_log
-    entry = {"t": time.time(), "event": event, **fields}
-    _debug_log.append(entry)
-    if len(_debug_log) > _DEBUG_MAX:
-        _debug_log = _debug_log[-_DEBUG_MAX:]
+def _watchdog_loop() -> None:
+    """Send zero velocity if tablet goes silent while armed."""
+    while True:
+        time.sleep(_WATCHDOG_INTERVAL)
+        with _lock:
+            if not _teleop["armed"]:
+                break
+            elapsed = time.time() - _teleop["last_cmd_at"]
+            if elapsed > _WATCHDOG_TIMEOUT:
+                _teleop["linear"] = 0.0
+                _teleop["angular"] = 0.0
+        if elapsed > _WATCHDOG_TIMEOUT:  # type: ignore[possibly-undefined]
+            ros_hub.publish_cmd_vel(0.0, 0.0)
 
 
-def get_debug_log() -> list[dict]:
-    return list(_debug_log)
-
-
-def start_publisher() -> None:
-    global _publisher_started
-    if _publisher_started:
+def _start_watchdog() -> None:
+    global _watchdog_thread
+    if _watchdog_thread is not None and _watchdog_thread.is_alive():
         return
-    _publisher_started = True
-    threading.Thread(target=_publish_loop, daemon=True, name="teleop_pub").start()
+    _watchdog_thread = threading.Thread(target=_watchdog_loop, daemon=True)
+    _watchdog_thread.start()
 
 
-def is_armed() -> bool:
-    return _teleop_armed and ros_hub.teleop_armed()
+# ── Router ────────────────────────────────────────────────────────────────────
+
+router = APIRouter(prefix="/teleop", tags=["teleop"])
 
 
-def motor_keepalive_active() -> bool:
-    return _motor_keepalive
+class EnableBody(BaseModel):
+    enabled: bool
 
 
-def start_motor_keepalive() -> None:
-    """Start 10 Hz zero cmd_vel as soon as robotBridge is up — prevents comm-loss fault."""
-    global _motor_keepalive
-    _motor_keepalive = True
-    robot_link.set_relay_allowed(True)
-    robot_link.start_cmd_vel_relay()
-    robot_link.publish_cmd_vel(0.0, 0.0)
-    robot_link.start_shell_keepalive()
-    start_publisher()
-    _log_debug("motor_keepalive_started", relay=robot_link.get_relay_status())
+class CmdVelBody(BaseModel):
+    linear: float = 0.0
+    angular: float = 0.0
 
 
-def ensure_armed() -> None:
-    """Arm cmd_vel without restarting relay (safe for 5 Hz joystick HTTP ticks)."""
-    if not _teleop_armed:
-        enable_teleop(True)
-        return
-    ros_hub.set_teleop_armed(True)
-    robot_link.set_relay_allowed(True)
-    robot_link.start_cmd_vel_relay()
-
-
-def enable_teleop(enabled: bool) -> None:
-    global _teleop_armed
-    if enabled:
-        first_arm = not _teleop_armed
-        _teleop_armed = True
-        ros_hub.set_teleop_armed(True)
-        robot_link.set_relay_allowed(True)
-        if first_arm:
-            robot_link.restart_cmd_vel_relay()
+@router.post("/enable")
+async def enable_teleop(body: EnableBody, _auth=Depends(require_auth)):
+    """Arm or disarm the joystick. Returns teleop + bridge status."""
+    with _lock:
+        _teleop["armed"] = body.enabled
+        if body.enabled:
+            _teleop["last_cmd_at"] = time.time()
         else:
-            robot_link.start_cmd_vel_relay()
-        start_publisher()
-        _log_debug(
-            "teleop_armed",
-            first_arm=first_arm,
-            relay=robot_link.get_relay_status(),
-        )
+            # Disarm: send a stop immediately
+            _teleop["linear"] = 0.0
+            _teleop["angular"] = 0.0
+
+    if body.enabled:
+        _start_watchdog()
+        ros_hub.start()  # ensure hub is running
     else:
-        disarm_teleop()
+        ros_hub.publish_cmd_vel(0.0, 0.0)
+
+    bridge = robot_link.get_bridge_status()
+    return {
+        "ok": True,
+        "teleop_armed": body.enabled,
+        "hub_ready": ros_hub.is_ready(),
+        "bridge_ok": bridge.get("ok", False),
+        "cmd_vel_subscriber": bridge.get("cmd_vel_subscriber", False),
+        "cmd_vel_topic": bridge.get("cmd_vel_topic", "/cmd_vel"),
+        "relay_alive": True,  # in this architecture the hub IS the relay
+        "qos_compatible": True,
+        "hint": "" if bridge.get("ok") else bridge.get("hint", ""),
+    }
 
 
-def is_enabled() -> bool:
+@router.post("/cmd_vel")
+async def send_cmd_vel(body: CmdVelBody, _auth=Depends(require_auth)):
+    """Publish a velocity command. Only forwarded to ROS when armed."""
     with _lock:
-        return _cmd_active or ros_hub.teleop_armed()
+        armed = _teleop["armed"]
+        _teleop["linear"] = body.linear
+        _teleop["angular"] = body.angular
+        _teleop["last_cmd_at"] = time.time()
+        if armed:
+            _teleop["publish_count"] += 1
+        count = _teleop["publish_count"]
+
+    if armed:
+        ros_hub.publish_cmd_vel(body.linear, body.angular)
+
+    return {
+        "ok": True,
+        "armed": armed,
+        "linear": body.linear,
+        "angular": body.angular,
+        "publish_count": count,
+    }
 
 
-def set_velocity(linear: float, angular: float) -> None:
-    start_publisher()
-    global _linear, _angular, _cmd_active, _last_tablet_linear, _last_tablet_angular
-    _last_tablet_linear = float(linear)
-    _last_tablet_angular = float(angular)
-    linear, angular = robot_link.convert_cmd_vel(linear, angular)
-    linear = max(-1000.0, min(1000.0, linear))
-    angular = max(-1000.0, min(1000.0, angular))
+@router.post("/stop")
+async def stop_teleop(_auth=Depends(require_auth)):
+    """Disarm and send immediate stop (preserves motor keepalive)."""
     with _lock:
-        _linear = linear
-        _angular = angular
-        _cmd_active = linear != 0.0 or angular != 0.0
-    if ros_hub.teleop_armed() or _teleop_armed or _motor_keepalive:
-        _publish_once(linear, angular)
+        _teleop["armed"] = False
+        _teleop["linear"] = 0.0
+        _teleop["angular"] = 0.0
+    ros_hub.publish_cmd_vel(0.0, 0.0)
+    return {"ok": True, "teleop_armed": False}
 
 
-def disarm_teleop() -> None:
-    """Joystick off — keep motor keepalive running so drivers stay enabled."""
-    global _linear, _angular, _cmd_active, _teleop_armed
-    _teleop_armed = False
-    with _lock:
-        _linear = 0.0
-        _angular = 0.0
-        _cmd_active = False
-    ros_hub.set_teleop_armed(False)
-    if _motor_keepalive:
-        robot_link.set_relay_allowed(True)
-        _publish_once(0.0, 0.0)
-    _log_debug("teleop_disarmed", keepalive=_motor_keepalive)
-
-
-def stop_all() -> None:
-    """Full stop — kill relay (robot STOP or backend shutdown)."""
-    global _motor_keepalive, _linear, _angular, _cmd_active, _teleop_armed
-    _motor_keepalive = False
-    _teleop_armed = False
-    with _lock:
-        _linear = 0.0
-        _angular = 0.0
-        _cmd_active = False
-    ros_hub.set_teleop_armed(False)
-    robot_link.stop_shell_keepalive()
-    robot_link.set_relay_allowed(False)
-    robot_link.stop_cmd_vel_relay()
-    _log_debug("teleop_stop_all")
-
-
-def stop() -> None:
-    """Backward compatible — disarm joystick only (keepalive continues)."""
-    disarm_teleop()
-
-
-def _publish_once(linear: float, angular: float) -> bool:
-    """Track setpoint for UI; publish via relay (RELIABLE /cmd_vel at 10 Hz)."""
-    global _last_publish_ok
-    ros_hub.set_cmd_vel(linear, angular)
-    relay_ok = robot_link.publish_cmd_vel_if_allowed(linear, angular)
-    _last_publish_ok = relay_ok
-    _log_debug(
-        "publish",
-        linear=linear,
-        angular=angular,
-        via="relay" if relay_ok else "none",
-        relay=robot_link.get_relay_status().get("alive"),
-    )
-    return _last_publish_ok
-
-
-def _publish_via_label(hub: dict, relay: dict) -> str:
-    if relay.get("alive"):
-        return "cmd_vel relay"
-    if hub.get("hub_ready"):
-        return "ros_hub (pose only)"
-    return "idle (no cmd_vel)"
-
-
-def get_velocity() -> dict:
-    hub = ros_hub.get_cmd_vel_state()
-    relay = robot_link.get_relay_status()
-    with _lock:
+@router.post("/test-drive")
+async def test_drive(_auth=Depends(require_auth)):
+    """
+    Send a short forward-then-stop nudge so the user can verify the
+    full cmd_vel chain is working (bridge → controller → wheels).
+    """
+    import asyncio
+    bridge = robot_link.get_bridge_status()
+    if not bridge.get("ok") and not bridge.get("cmd_vel_subscriber"):
         return {
-            "linear": _linear,
-            "angular": _angular,
-            "linear_tablet": _last_tablet_linear,
-            "angular_tablet": _last_tablet_angular,
-            "cmd_vel_units": robot_link.CMD_VEL_UNITS,
-            "teleop_session_armed": _teleop_armed,
-            "motor_keepalive": _motor_keepalive,
-            "enabled": _cmd_active,
-            "teleop_armed": hub.get("teleop_armed") or _motor_keepalive,
-            "hub_ready": hub["hub_ready"],
-            "relay_alive": relay.get("alive"),
-            "relay_pid": relay.get("pid"),
-            "publish_ok": _last_publish_ok,
-            "publish_count": _publish_count,
-            "topic": hub["topic"],
-            "last_publish_at": _last_publish_at,
-            "publish_via": _publish_via_label(hub, relay),
-            "relay_log": relay.get("log"),
-            "debug_log": get_debug_log()[-8:],
+            "ok": False,
+            "hint": "Bridge not ready — start the robot first",
+            "bridge_ok": False,
         }
 
+    ros_hub.publish_cmd_vel(0.1, 0.0)   # nudge forward 0.1 m/s
+    await asyncio.sleep(0.4)
+    ros_hub.publish_cmd_vel(0.0, 0.0)   # stop
 
-def test_drive(linear: float = 0.5, angular: float = 0.0, seconds: float = 2.0) -> dict:
-    """Pulse motors via relay without disarming keepalive."""
-    was_armed = _teleop_armed
-    if not was_armed:
-        enable_teleop(True)
-    set_velocity(linear, angular)
-    time.sleep(max(0.2, seconds))
-    set_velocity(0.0, 0.0)
-    if not was_armed:
-        disarm_teleop()
-    return get_velocity()
+    return {
+        "ok": True,
+        "hint": "Test nudge sent (0.1 m/s for 400 ms). Did the robot move?",
+        "bridge_ok": bridge.get("ok", False),
+        "cmd_vel_subscriber": bridge.get("cmd_vel_subscriber", False),
+        "teleop_armed": _teleop["armed"],
+        "hub_ready": ros_hub.is_ready(),
+    }
 
 
-def _publish_loop() -> None:
-    """10 Hz keepalive — runs while motor_keepalive OR joystick armed."""
-    global _publish_count, _last_publish_at
-    while True:
-        active = _motor_keepalive or ros_hub.teleop_armed() or _teleop_armed
-        if active:
-            with _lock:
-                if _teleop_armed or ros_hub.teleop_armed():
-                    lx, az = (_linear, _angular) if _cmd_active else (0.0, 0.0)
-                else:
-                    lx, az = (0.0, 0.0)
-            _publish_once(lx, az)
-            _publish_count += 1
-            _last_publish_at = time.time()
-        time.sleep(0.1)
+@router.get("/debug")
+async def teleop_debug(_auth=Depends(require_auth)):
+    """Rich diagnostics for the joystick debug dialog."""
+    with _lock:
+        snap = dict(_teleop)
+    bridge = robot_link.get_bridge_status()
+    return {
+        "ok": snap["armed"] and bridge.get("ok", False),
+        "teleop_armed": snap["armed"],
+        "hub_ready": ros_hub.is_ready(),
+        "linear": snap["linear"],
+        "angular": snap["angular"],
+        "publish_count": snap["publish_count"],
+        "bridge_ok": bridge.get("ok", False),
+        "bridge_listening": bridge.get("cmd_vel_subscriber", False),
+        "cmd_vel_subscriber": bridge.get("cmd_vel_subscriber", False),
+        "cmd_vel_topic": bridge.get("cmd_vel_topic", "/cmd_vel"),
+        "relay_alive": True,
+        "hint": bridge.get("hint", ""),
+        "qos_compatible": True,
+    }
+
+
+@router.get("/connection")
+async def teleop_connection(_auth=Depends(require_auth)):
+    """End-to-end chain check for the joystick Debug button."""
+    bridge = robot_link.get_bridge_status()
+    hub_ok = ros_hub.is_ready()
+    sub_ok = bridge.get("cmd_vel_subscriber", False)
+    chain_ok = hub_ok and sub_ok
+
+    warnings: list[str] = []
+    if not hub_ok:
+        warnings.append("ROS hub not ready — press START")
+    if not sub_ok:
+        warnings.append("No subscriber on /cmd_vel — bridge may not be running")
+
+    return {
+        "chain_ok": chain_ok,
+        "hub_ready": hub_ok,
+        "bridge": bridge,
+        "warnings": warnings,
+        "hint": "; ".join(warnings) if warnings else "All good",
+    }

@@ -331,12 +331,6 @@ class PiDiscoveryService {
     await flush();
   }
 
-  Future<void> _discoverHttpSubnet(Map<String, DiscoveredPi> found) async {
-    final prefix = await subnetPrefix();
-    if (prefix == null) return;
-    await _discoverHttpPrefix(found, prefix);
-  }
-
   Future<void> _discoverUdp(
     Map<String, DiscoveredPi> found,
     Duration timeout,

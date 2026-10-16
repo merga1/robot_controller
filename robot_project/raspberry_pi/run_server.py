@@ -1,81 +1,57 @@
 #!/usr/bin/env python3
-"""Start the Robot Control API server."""
+"""
+run_server.py — Entry point for the robot Pi backend.
+
+Usage (from raspberry_pi/ directory):
+    # Source environment first:
+    set -a && source real1_link.env && set +a
+
+    # Then start the server:
+    python3 run_server.py
+
+    # Or directly with uvicorn for hot-reload during development:
+    uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+The server listens on all interfaces (0.0.0.0) so the Flutter tablet app
+can reach it over Wi-Fi. The port defaults to 8000 and can be overridden
+with the PORT environment variable.
+"""
+
+import os
 import sys
+from pathlib import Path
 
+# Ensure the raspberry_pi/ directory is on the Python path so
+# `from app.main import app` works when running as a script.
+_HERE = Path(__file__).parent.resolve()
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
 
-def _preflight() -> None:
-    """Fail fast if the Pi deployment is missing updated app modules.
-
-    Checks specifically target functions that were absent from older,
-    stale snapshots of app/ (pre RPM-unit-conversion, pre cmd_vel-relay,
-    pre motor-keepalive) that once caused the robot to report "connected"
-    while never actually sending a nonzero cmd_vel to the articubot_one stack.
-    A weaker version of this check (testing only attribute names common to both
-    old and new code) could not catch that regression — these names can't.
-    """
-    required = {
-        "app.robot_link": (
-            "validate_link",
-            "try_start_robot_bridge",
-            "check_cmd_vel",
-            "convert_cmd_vel",          # RPM unit scaling
-            "publish_cmd_vel",          # cmd_vel relay writer
-            "start_cmd_vel_relay",      # persistent RELIABLE-QoS publisher
-            "run_enable_motors",        # motor enable workflow
-        ),
-        "app.ros_hub": ("start", "resync_cmd_vel_topic", "set_cmd_vel", "teleop_armed"),
-        "app.teleop": (
-            "set_velocity",
-            "stop",
-            "start_motor_keepalive",
-            "ensure_armed",
-        ),
-    }
-    errors = []
-    for module_name, attrs in required.items():
-        try:
-            mod = __import__(module_name, fromlist=list(attrs))
-        except ImportError as exc:
-            errors.append(f"Missing module {module_name}: {exc}")
+# Load real1_link.env if it exists and hasn't been sourced yet
+_ENV_FILE = _HERE / "real1_link.env"
+if _ENV_FILE.exists() and not os.getenv("REAL1_WS"):
+    print(f"[run_server] Loading env from {_ENV_FILE}")
+    for line in _ENV_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
             continue
-        for attr in attrs:
-            if not hasattr(mod, attr):
-                errors.append(f"{module_name} is outdated — missing {attr}()")
-    if errors:
-        print("Backend deployment incomplete. Copy ALL files from raspberry_pi/ to ~/raspberry_pi/", file=sys.stderr)
-        for err in errors:
-            print(f"  - {err}", file=sys.stderr)
-        sys.exit(1)
+        key, _, val = line.partition("=")
+        os.environ.setdefault(key.strip(), val.strip())
 
+import uvicorn
 
 if __name__ == "__main__":
-    try:
-        _preflight()
-    except Exception as exc:
-        print(f"Preflight error: {exc}", file=sys.stderr)
-        sys.exit(1)
-    try:
-        import uvicorn
-    except ImportError:
-        print("Missing uvicorn. Run: pip3 install -r requirements.txt", file=sys.stderr)
-        sys.exit(1)
+    host = os.getenv("ROBOT_API_HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", os.getenv("ROBOT_API_PORT", "8000")))
+    reload = os.getenv("ROBOT_API_RELOAD", "0") == "1"
 
-    print("Starting Robot Control API on http://0.0.0.0:8000", flush=True)
-    from app import robot_link
+    print(f"[run_server] Starting robot API on http://{host}:{port}")
+    print(f"[run_server] REAL1_WS = {os.getenv('REAL1_WS', '(not set)')}")
 
-    robot_link.apply_ros_environment()
-    try:
-        import rclpy
-
-        if not rclpy.ok():
-            rclpy.init(args=None)
-        print("rclpy OK — in-process cmd_vel hub will be used", flush=True)
-    except ImportError:
-        print(
-            "rclpy not found in this Python — joystick uses cmd_vel relay subprocess",
-            flush=True,
-        )
-    except Exception as exc:
-        print(f"rclpy init warning: {exc} — using cmd_vel relay", flush=True)
-
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run(
+        "app.main:app",
+        host=host,
+        port=port,
+        reload=reload,
+        log_level="info",
+    )

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import '../models/robot_state.dart';
+import '../models/map_models.dart';
 
 /// REST client for the Pi. Polling is intentional: it keeps the app useful on
 /// lab Wi-Fi where a WebSocket connection is frequently interrupted.
@@ -123,21 +124,54 @@ class RobotService {
     await _request('POST', '/navigation/goal', body: {'destination': name});
   }
 
-  // Pi returns {"destinations": [...]} where destinations is a List<String>
+  // Pi returns {"destinations": [{"name":"...","x":...,"y":...,"theta":...}, ...]}
+  // Also handles old-format lists of strings for backward compatibility.
   Future<List<String>> getDestinations() async {
     final raw = (await _request('GET', '/destinations'))['destinations'];
     if (raw is List) {
-      final names = raw.map((e) => e.toString()).toList();
-      names.sort();
-      return names;
+      return raw.map((e) {
+        if (e is Map) return (e['name'] ?? '').toString();
+        return e.toString();
+      }).toList()..sort();
     }
-    // Fallback: if a Map is returned, use its keys
     if (raw is Map) {
-      final names = raw.keys.map((e) => e.toString()).toList();
-      names.sort();
-      return names;
+      return (raw.keys.map((e) => e.toString()).toList())..sort();
     }
     return [];
+  }
+
+  /// Returns destinations with full pose data for the NavigationScreen.
+  Future<List<DestinationPose>> getDestinationPoses() async {
+    final raw = (await _request('GET', '/destinations'))['destinations'];
+    if (raw is List) {
+      return raw
+          .map((e) {
+            if (e is Map<String, dynamic>) {
+              return DestinationPose.fromJson(e);
+            }
+            // Old format: just a name string, no coordinates
+            return DestinationPose(
+              name: e.toString(),
+              x: 0,
+              y: 0,
+              theta: 0,
+            );
+          })
+          .toList();
+    }
+    return [];
+  }
+
+  /// Full URL for the map image — used by NavigationScreen to load the map.
+  String get mapImageUrl => '$baseUrl/navigation/map/image';
+
+  /// Current auth token (needed to add Authorization header to image requests).
+  String? get authToken => _token;
+
+  /// Fetch map metadata (resolution, origin, image size).
+  Future<MapMeta> getMapMeta() async {
+    final data = await _request('GET', '/navigation/map');
+    return MapMeta.fromJson(data);
   }
 
   // Pi endpoint is POST /destinations with body {name, x, y, theta}

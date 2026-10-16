@@ -90,7 +90,7 @@ class _LogsScreenState extends State<LogsScreen> {
           return ListView.separated(
             padding: const EdgeInsets.all(12),
             itemCount: logs.length,
-            separatorBuilder: (_, __) => const Divider(height: 1),
+            separatorBuilder: (_, _) => const Divider(height: 1),
             itemBuilder: (_, i) {
               final entry = logs[i] as Map<String, dynamic>;
               final sev = entry['severity']?.toString() ?? 'info';
